@@ -80,15 +80,54 @@ _CLEANUP_STEP_CODES = frozenset(
         "cleanup_state_unknown",
     )
 )
+_CLEANUP_SCOPES = frozenset(("run_session", "assembly_proxy", "unknown"))
+_FIXED_CLEANUP_ACTIONS = frozenset(
+    (
+        "broker.stop",
+        "store.stop",
+        "store.metadata_probe",
+        "proxy.disconnect",
+        "components.inventory",
+        "session.closed",
+        "cleanup.state",
+        "cleanup.owner",
+    )
+)
+
+
+def _valid_cleanup_action(value: object) -> bool:
+    if type(value) is not str or not value.isascii():
+        return False
+    if value in _FIXED_CLEANUP_ACTIONS:
+        return True
+    for prefix in ("feed.stop/", "component.stop/"):
+        if value.startswith(prefix):
+            suffix = value[len(prefix) :]
+            return bool(suffix) and suffix.isdigit() and suffix.isascii()
+    return False
 
 
 @dataclass(frozen=True)
 class RuntimeCleanupReport:
-    """Finite cleanup observations without provider exception details."""
+    """Finite, scoped cleanup observations without provider exception details.
+
+    ``required_actions`` names the anonymous actions this report covers.
+    ``complete`` is false for an empty report, a missing action observation,
+    or any failed, pending, or unknown required action. This public value object
+    carries caller-supplied observations; its scope and action ids have no
+    provenance or authorization authority. ``unknown_actions`` is a separate
+    unresolved category and does not need duplication in ``pending_actions``.
+    """
 
     failed_steps: tuple[str, ...] = ()
     pending_steps: tuple[str, ...] = ()
     confirmed_steps: tuple[str, ...] = ()
+    scope: str = "unknown"
+    required_actions: tuple[str, ...] = ()
+    failed_actions: tuple[str, ...] = ()
+    pending_actions: tuple[str, ...] = ()
+    confirmed_actions: tuple[str, ...] = ()
+    unknown_actions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for values in (self.failed_steps, self.pending_steps, self.confirmed_steps):
@@ -96,11 +135,46 @@ class RuntimeCleanupReport:
                 type(value) is not str or value not in _CLEANUP_STEP_CODES for value in values
             ):
                 raise ValueError("cleanup report contains an unsupported step code")
+        if type(self.scope) is not str or self.scope not in _CLEANUP_SCOPES:
+            raise ValueError("cleanup report contains an unsupported scope")
+        action_groups = (
+            self.required_actions,
+            self.failed_actions,
+            self.pending_actions,
+            self.confirmed_actions,
+            self.unknown_actions,
+        )
+        for values in action_groups:
+            if type(values) is not tuple or any(not _valid_cleanup_action(value) for value in values):
+                raise ValueError("cleanup report contains an unsupported action identifier")
+            if len(values) != len(set(values)):
+                raise ValueError("cleanup report contains a duplicate action identifier")
+        required = set(self.required_actions)
+        if any(not set(values).issubset(required) for values in action_groups[1:]):
+            raise ValueError("cleanup report observes an action that is not required")
+        if set(self.confirmed_actions).intersection(
+            (*self.failed_actions, *self.pending_actions, *self.unknown_actions)
+        ):
+            raise ValueError("cleanup report action cannot be both confirmed and unresolved")
+        if set(self.unknown_actions).intersection(
+            (*self.failed_actions, *self.pending_actions)
+        ):
+            raise ValueError("unknown cleanup actions cannot also be failed or pending")
 
     @property
     def complete(self) -> bool:
-        """Whether every required cleanup action returned and state was confirmed."""
-        return not self.failed_steps and not self.pending_steps
+        """Whether every required action in this report's scope was confirmed."""
+        if self.scope == "unknown" or not self.required_actions:
+            return False
+        required = set(self.required_actions)
+        return (
+            required.issubset(self.confirmed_actions)
+            and not self.failed_actions
+            and not self.pending_actions
+            and not self.unknown_actions
+            and not self.failed_steps
+            and not self.pending_steps
+        )
 
 
 @dataclass(frozen=True)
@@ -114,11 +188,27 @@ def _cleanup_report(
     failed: list[str] | tuple[str, ...] = (),
     pending: list[str] | tuple[str, ...] = (),
     confirmed: list[str] | tuple[str, ...] = (),
+    scope: str = "run_session",
+    required_actions: list[str] | tuple[str, ...] = (),
+    failed_actions: list[str] | tuple[str, ...] = (),
+    pending_actions: list[str] | tuple[str, ...] = (),
+    confirmed_actions: list[str] | tuple[str, ...] = (),
+    unknown_actions: list[str] | tuple[str, ...] = (),
 ) -> RuntimeCleanupReport:
     def unique(values):
         return tuple(dict.fromkeys(values))
 
-    return RuntimeCleanupReport(unique(failed), unique(pending), unique(confirmed))
+    return RuntimeCleanupReport(
+        failed_steps=unique(failed),
+        pending_steps=unique(pending),
+        confirmed_steps=unique(confirmed),
+        scope=scope,
+        required_actions=unique(required_actions),
+        failed_actions=unique(failed_actions),
+        pending_actions=unique(pending_actions),
+        confirmed_actions=unique(confirmed_actions),
+        unknown_actions=unique(unknown_actions),
+    )
 
 
 def _attach_cleanup_report(
@@ -184,10 +274,15 @@ def _preflight_v2_provider_factory(
         raise RuntimeAssemblyError("provider_binding_preflight_failed") from None
 
 
-def _disconnect_proxy(proxy: ServiceReadProxy) -> _CleanupOutcome:
+def _disconnect_proxy(
+    proxy: ServiceReadProxy, *, scope: str = "run_session"
+) -> _CleanupOutcome:
     failed = []
     pending = []
     confirmed = []
+    failed_actions = []
+    pending_actions = []
+    confirmed_actions = []
     interruption = None
     try:
         proxy.disconnect()
@@ -196,13 +291,26 @@ def _disconnect_proxy(proxy: ServiceReadProxy) -> _CleanupOutcome:
         # ServiceReadProxy.is_connected is false while a failed disconnect is
         # still in its closing state. A raised close therefore stays pending.
         pending.append("proxy_disconnect")
+        failed_actions.append("proxy.disconnect")
+        pending_actions.append("proxy.disconnect")
         if _is_control_interrupt(error):
             interruption = error
     else:
         confirmed.append("proxy_disconnect")
+        confirmed_actions.append("proxy.disconnect")
 
     return _CleanupOutcome(
-        _cleanup_report(failed=failed, pending=pending, confirmed=confirmed), interruption
+        _cleanup_report(
+            failed=failed,
+            pending=pending,
+            confirmed=confirmed,
+            scope=scope,
+            required_actions=("proxy.disconnect",),
+            failed_actions=failed_actions,
+            pending_actions=pending_actions,
+            confirmed_actions=confirmed_actions,
+        ),
+        interruption,
     )
 
 
@@ -552,6 +660,7 @@ class RunSession:
         "_cleanup_attempted",
         "_cleanup_report",
         "_closed",
+        "_component_action_bindings",
         "_environment",
         "_mode",
         "_owner_thread_id",
@@ -579,6 +688,12 @@ class RunSession:
         self._closed = False
         self._cleanup_attempted = False
         self._cleanup_report: RuntimeCleanupReport | None = None
+        # Keep each object strongly bound to its anonymous id for the session
+        # lifetime. A bare id() map could collide after a feed is removed from
+        # Cerebro and collected, and retries must retain unresolved obligations.
+        self._component_action_bindings: list[tuple[object, str]] = []
+        for component in self._unique_components(cerebro.datas, cerebro.feeds):
+            self._remember_component_action_id(component)
 
     def _assert_owner_thread(self) -> None:
         if threading.get_ident() != self._owner_thread_id:
@@ -633,6 +748,25 @@ class RunSession:
                 seen.add(identity)
                 yield component
 
+    def _remember_component_action_id(self, component: object) -> str:
+        """Assign an anonymous per-session action id without reading feed names."""
+        for bound_component, action_id in self._component_action_bindings:
+            if bound_component is component:
+                return action_id
+        prefix = "feed.stop/" if type(component) is BtApiFeed else "component.stop/"
+        existing_ids = {action_id for _bound_component, action_id in self._component_action_bindings}
+        if self._cleanup_report is not None:
+            existing_ids.update(self._cleanup_report.required_actions)
+        index = 0
+        while f"{prefix}{index}" in existing_ids:
+            index += 1
+        action_id = f"{prefix}{index}"
+        self._component_action_bindings.append((component, action_id))
+        return action_id
+
+    def _component_action_id(self, component: object) -> str:
+        return self._remember_component_action_id(component)
+
     def _metadata_probe_shutdown_pending(self) -> bool:
         condition = self._store._read_only_metadata_probe_condition
         with condition:
@@ -651,11 +785,21 @@ class RunSession:
         checked before retrying it. The final direct proxy close is used only
         when no Store stop completed, including partial Store startup where the
         proxy connected before Store flags were committed. Exception details
-        are intentionally discarded; only fixed cleanup step codes are kept.
+        are intentionally discarded. The report keeps per-action anonymous ids;
+        only the exact BtApiFeed type has a supported per-feed state contract.
         """
         failed = []
         pending = []
         confirmed = []
+        required_actions = [
+            "broker.stop",
+            "store.stop",
+            "proxy.disconnect",
+        ]
+        failed_actions = []
+        pending_actions = []
+        confirmed_actions = []
+        unknown_actions = []
         interruption = None
 
         def capture_interrupt(error: BaseException) -> None:
@@ -667,66 +811,182 @@ class RunSession:
         store_state_known = True
 
         previous_report = self._cleanup_report
-        if (
+        broker_was_confirmed = (
             previous_report is not None
-            and "broker_stop" in previous_report.confirmed_steps
-        ):
-            # A prior owner-thread attempt completed the Broker's read-only
-            # shutdown method. Retry an unconfirmed Store stop below without
-            # rerunning its snapshot/summary path or asking it to stop Store
-            # again. A Broker stop that raised remains retryable.
+            and "broker.stop" in previous_report.confirmed_actions
+        )
+        broker_state_known = False
+        broker_live_started = None
+        try:
+            if type(self._broker) is BtApiBroker:
+                broker_live_started = object.__getattribute__(self._broker, "_live_started")
+                broker_state_known = type(broker_live_started) is bool
+        except BaseException as error:  # noqa: BLE001 - unreadable state is never a stop receipt
+            capture_interrupt(error)
+
+        if not broker_state_known:
+            pending.append("broker_stop")
+            unknown_actions.append("broker.stop")
+        elif broker_was_confirmed and broker_live_started is False:
+            # This is only the exact Broker's current live-start flag. Store,
+            # proxy, and Feed obligations are observed independently below;
+            # it does not claim whole-Cerebro or account shutdown.
             confirmed.append("broker_stop")
+            confirmed_actions.append("broker.stop")
         else:
             try:
                 self._broker.stop()
             except BaseException as error:  # noqa: BLE001 - continue every cleanup layer
                 failed.append("broker_stop")
+                failed_actions.append("broker.stop")
                 capture_interrupt(error)
             else:
-                confirmed.append("broker_stop")
+                try:
+                    broker_live_started = object.__getattribute__(
+                        self._broker, "_live_started"
+                    )
+                    broker_state_known = (
+                        type(self._broker) is BtApiBroker and type(broker_live_started) is bool
+                    )
+                except BaseException as error:  # noqa: BLE001 - retain finite unknown state
+                    broker_state_known = False
+                    capture_interrupt(error)
+                if not broker_state_known:
+                    pending.append("broker_stop")
+                    unknown_actions.append("broker.stop")
+                elif broker_live_started is False:
+                    confirmed.append("broker_stop")
+                    confirmed_actions.append("broker.stop")
+                else:
+                    pending.append("broker_stop")
+                    pending_actions.append("broker.stop")
 
         try:
             store_stop_confirmed = self._store._service_read_only_stopped is True
         except BaseException as error:  # noqa: BLE001 - do not guess Store ownership state
             failed.append("store_state")
             pending.append("store_state")
+            unknown_actions.append("store.stop")
             store_state_known = False
             capture_interrupt(error)
         else:
             if store_stop_confirmed:
                 confirmed.append("store_stop")
+                confirmed_actions.append("store.stop")
+        metadata_probe_pending = False
 
         try:
-            components = tuple(self._unique_components(self._cerebro.datas, self._cerebro.feeds))
+            current_components = tuple(
+                self._unique_components(self._cerebro.datas, self._cerebro.feeds)
+            )
         except BaseException as error:  # noqa: BLE001 - continue Store/proxy cleanup
             failed.append("component_inventory")
             pending.append("component_inventory")
-            components = ()
+            required_actions.append("components.inventory")
+            unknown_actions.append("components.inventory")
+            current_components = ()
             capture_interrupt(error)
-        for component in components:
-            # Cerebro may already have completed its normal main-loop cleanup
-            # before surfacing a later exception. BtApiFeed publishes this
-            # lifecycle state; never stop an already-stopped feed a second time.
-            try:
-                component_active = bool(
-                    getattr(component, "_session_active", False)
-                    or getattr(component, "_tick_consumer_claimed", False)
+
+        current_component_ids = {id(component) for component in current_components}
+        current_action_ids = {
+            self._component_action_id(component) for component in current_components
+        }
+        component_bindings = tuple(self._component_action_bindings)
+        bound_action_ids = {action_id for _component, action_id in component_bindings}
+        component_candidates = list(current_components)
+        for component, action_id in component_bindings:
+            if id(component) in current_component_ids:
+                continue
+            # Keep session-owned components in the retry inventory even if
+            # application code removed them from both Cerebro collections.
+            # Their current supported state is re-read before reusing an older
+            # confirmation, since user code may have restarted a feed.
+            component_candidates.append(component)
+
+        if previous_report is not None:
+            for action_id in previous_report.required_actions:
+                is_component_action = action_id.startswith(
+                    ("feed.stop/", "component.stop/")
                 )
-            except BaseException as error:  # noqa: BLE001 - avoid an unproven duplicate stop
+                if not is_component_action:
+                    continue
+                if action_id not in bound_action_ids and action_id not in current_action_ids:
+                    # A required action without its identity-bound object cannot
+                    # be rechecked, even if an earlier report confirmed it.
+                    required_actions.append(action_id)
+                    unknown_actions.append(action_id)
+                    failed.append("component_inventory")
+                    pending.append("component_inventory")
+
+        components = tuple(self._unique_components(component_candidates))
+        for component in components:
+            action_id = self._component_action_id(component)
+            if type(component) is not BtApiFeed:
+                # This session only assembles exact BtApiFeed objects. An
+                # unexpected Cerebro component has no accepted state contract;
+                # do not turn absent attributes into an inactive state or call
+                # an unreviewed stop method.
+                required_actions.append(action_id)
+                unknown_actions.append(action_id)
                 failed.append("component_state")
                 pending.append("component_state")
+                continue
+
+            # A failed stop can leave the feed in a terminal state while its
+            # exception is still authoritative for that attempt. On an explicit
+            # owner-thread retry, the exact feed's two published flags provide
+            # a fresh observation without repeating an already-finished stop.
+            was_required = previous_report is not None and action_id in previous_report.required_actions
+            try:
+                session_active = object.__getattribute__(component, "_session_active")
+                tick_consumer_claimed = object.__getattribute__(
+                    component, "_tick_consumer_claimed"
+                )
+                if type(session_active) is not bool or type(tick_consumer_claimed) is not bool:
+                    raise AttributeError("feed lifecycle state unavailable")
+            except BaseException as error:  # noqa: BLE001 - avoid an unproven duplicate stop
+                required_actions.append(action_id)
+                failed.append("component_state")
+                pending.append("component_state")
+                unknown_actions.append(action_id)
                 capture_interrupt(error)
                 continue
+            component_active = session_active or tick_consumer_claimed
             if not component_active:
+                if was_required:
+                    required_actions.append(action_id)
+                    confirmed_actions.append(action_id)
+                    confirmed.append("component_stop")
                 continue
+            required_actions.append(action_id)
             try:
                 component.stop()
             except BaseException as error:  # noqa: BLE001 - continue every cleanup layer
                 failed.append("component_stop")
                 pending.append("component_stop")
+                failed_actions.append(action_id)
+                pending_actions.append(action_id)
                 capture_interrupt(error)
             else:
-                confirmed.append("component_stop")
+                try:
+                    session_active = object.__getattribute__(component, "_session_active")
+                    tick_consumer_claimed = object.__getattribute__(
+                        component, "_tick_consumer_claimed"
+                    )
+                    if type(session_active) is not bool or type(tick_consumer_claimed) is not bool:
+                        raise AttributeError("feed lifecycle state unavailable")
+                except BaseException as error:  # noqa: BLE001 - keep state explicitly unknown
+                    failed.append("component_state")
+                    pending.append("component_state")
+                    unknown_actions.append(action_id)
+                    capture_interrupt(error)
+                else:
+                    if not session_active and not tick_consumer_claimed:
+                        confirmed.append("component_stop")
+                        confirmed_actions.append(action_id)
+                    else:
+                        pending.append("component_stop")
+                        pending_actions.append(action_id)
 
         # A read-only connect may succeed before Store.start commits _started;
         # a later account read can reset _connected while leaving the proxy
@@ -736,46 +996,90 @@ class RunSession:
                 self._store.stop()
             except BaseException as error:  # noqa: BLE001 - proxy close may still be attempted
                 failed.append("store_stop")
+                failed_actions.append("store.stop")
                 capture_interrupt(error)
             try:
                 store_stop_confirmed = self._store._service_read_only_stopped is True
             except BaseException as error:  # noqa: BLE001 - do not guess whether proxy is owned
                 failed.append("store_state")
                 pending.append("store_state")
+                pending_actions.append("store.stop")
                 store_state_known = False
                 capture_interrupt(error)
             else:
-                if store_stop_confirmed:
+                if store_stop_confirmed and "store.stop" not in failed_actions:
                     confirmed.append("store_stop")
+                    confirmed_actions.append("store.stop")
                 else:
-                    pending.append("store_stop_unconfirmed")
+                    if not store_stop_confirmed:
+                        pending.append("store_stop_unconfirmed")
+                        pending_actions.append("store.stop")
 
-        if not store_state_known:
-            # The Store is the owner of the proxy boundary. If its stopped
-            # state cannot be read, bypassing it with a direct disconnect could
-            # race a Store-owned worker or repeat a close already in progress.
-            pending.append("proxy_disconnect")
-        elif not store_stop_confirmed:
+        if store_state_known and not store_stop_confirmed:
+            required_actions.append("store.metadata_probe")
             try:
                 metadata_probe_pending = self._metadata_probe_shutdown_pending()
-            except BaseException as error:  # noqa: BLE001
+            except BaseException as error:  # noqa: BLE001 - do not guess worker ownership
                 failed.append("metadata_probe_state")
                 pending.append("metadata_probe_shutdown")
+                unknown_actions.append("store.metadata_probe")
+                metadata_probe_pending = True
                 capture_interrupt(error)
             else:
                 if metadata_probe_pending:
                     # BtApiStore refuses a concurrent disconnect while its metadata
                     # worker may still be reading this proxy. Preserve that custody.
                     pending.append("metadata_probe_shutdown")
+                    pending_actions.append("store.metadata_probe")
                 else:
-                    outcome = _disconnect_proxy(self._proxy)
-                    failed.extend(outcome.report.failed_steps)
-                    pending.extend(outcome.report.pending_steps)
-                    confirmed.extend(outcome.report.confirmed_steps)
-                    if interruption is None:
-                        interruption = outcome.interruption
+                    confirmed_actions.append("store.metadata_probe")
 
-        report = _cleanup_report(failed=failed, pending=pending, confirmed=confirmed)
+        if not store_state_known:
+            # The Store is the owner of the proxy boundary. If its stopped
+            # state cannot be read, bypassing it with a direct disconnect could
+            # race a Store-owned worker or repeat a close already in progress.
+            pending.append("proxy_disconnect")
+            unknown_actions.append("proxy.disconnect")
+        elif metadata_probe_pending:
+            pending.append("proxy_disconnect")
+            pending_actions.append("proxy.disconnect")
+        elif store_stop_confirmed:
+            try:
+                proxy_connected = self._proxy.is_connected
+            except BaseException as error:  # noqa: BLE001 - do not infer proxy state
+                failed.append("proxy_state")
+                pending.append("proxy_disconnect")
+                unknown_actions.append("proxy.disconnect")
+                capture_interrupt(error)
+            else:
+                if proxy_connected is False:
+                    confirmed.append("proxy_disconnect")
+                    confirmed_actions.append("proxy.disconnect")
+                else:
+                    pending.append("proxy_disconnect")
+                    pending_actions.append("proxy.disconnect")
+        else:
+            outcome = _disconnect_proxy(self._proxy)
+            failed.extend(outcome.report.failed_steps)
+            pending.extend(outcome.report.pending_steps)
+            confirmed.extend(outcome.report.confirmed_steps)
+            failed_actions.extend(outcome.report.failed_actions)
+            pending_actions.extend(outcome.report.pending_actions)
+            confirmed_actions.extend(outcome.report.confirmed_actions)
+            if interruption is None:
+                interruption = outcome.interruption
+
+        report = _cleanup_report(
+            failed=failed,
+            pending=pending,
+            confirmed=confirmed,
+            scope="run_session",
+            required_actions=required_actions,
+            failed_actions=failed_actions,
+            pending_actions=pending_actions,
+            confirmed_actions=confirmed_actions,
+            unknown_actions=unknown_actions,
+        )
         return _CleanupOutcome(report, interruption)
 
     def _record_cleanup_outcome(self, outcome: _CleanupOutcome) -> None:
@@ -788,7 +1092,11 @@ class RunSession:
             return self._compensate_failed_run()
         except BaseException as error:  # noqa: BLE001 - never leak secondary cleanup details
             report = _cleanup_report(
-                failed=("cleanup_state_unknown",), pending=("cleanup_state_unknown",)
+                failed=("cleanup_state_unknown",),
+                pending=("cleanup_state_unknown",),
+                scope="run_session",
+                required_actions=("cleanup.state",),
+                unknown_actions=("cleanup.state",),
             )
             interruption = error if _is_control_interrupt(error) else None
             return _CleanupOutcome(report, interruption)
@@ -808,6 +1116,12 @@ class RunSession:
                 failed=outcome.report.failed_steps + ("cleanup_state_unknown",),
                 pending=outcome.report.pending_steps + ("cleanup_state_unknown",),
                 confirmed=outcome.report.confirmed_steps,
+                scope=outcome.report.scope,
+                required_actions=outcome.report.required_actions + ("session.closed",),
+                failed_actions=outcome.report.failed_actions,
+                pending_actions=outcome.report.pending_actions,
+                confirmed_actions=outcome.report.confirmed_actions,
+                unknown_actions=outcome.report.unknown_actions + ("session.closed",),
             )
             self._record_cleanup_outcome(_CleanupOutcome(report))
             if primary is not None:
@@ -829,7 +1143,11 @@ class RunSession:
         except BaseException:  # noqa: BLE001 - fallback must not mask the primary failure
             outcome = _CleanupOutcome(
                 _cleanup_report(
-                    failed=("cleanup_state_unknown",), pending=("cleanup_state_unknown",)
+                    failed=("cleanup_state_unknown",),
+                    pending=("cleanup_state_unknown",),
+                    scope="run_session",
+                    required_actions=("cleanup.state",),
+                    unknown_actions=("cleanup.state",),
                 )
             )
         self._record_cleanup_outcome(outcome)
@@ -861,7 +1179,12 @@ class RunSession:
         try:
             store_stopped = self._store._service_read_only_stopped is True
         except BaseException as error:
-            report = _cleanup_report(failed=("store_state",), pending=("store_state",))
+            report = _cleanup_report(
+                failed=("store_state",),
+                pending=("store_state",),
+                required_actions=("store.stop", "proxy.disconnect"),
+                unknown_actions=("store.stop", "proxy.disconnect"),
+            )
             self._record_cleanup_outcome(_CleanupOutcome(report))
             _attach_cleanup_report(error, report)
             if _is_control_interrupt(error):
@@ -872,7 +1195,15 @@ class RunSession:
                 metadata_probe_pending = self._metadata_probe_shutdown_pending()
             except BaseException as error:
                 report = _cleanup_report(
-                    failed=("metadata_probe_state",), pending=("metadata_probe_shutdown",)
+                    failed=("metadata_probe_state",),
+                    pending=("metadata_probe_shutdown",),
+                    required_actions=(
+                        "store.stop",
+                        "store.metadata_probe",
+                        "proxy.disconnect",
+                    ),
+                    pending_actions=("store.stop", "proxy.disconnect"),
+                    unknown_actions=("store.metadata_probe",),
                 )
                 self._record_cleanup_outcome(_CleanupOutcome(report))
                 _attach_cleanup_report(error, report)
@@ -880,7 +1211,19 @@ class RunSession:
                     raise
                 raise RuntimeAssemblyError("provider_cleanup_incomplete") from None
             if metadata_probe_pending:
-                report = _cleanup_report(pending=("metadata_probe_shutdown",))
+                report = _cleanup_report(
+                    pending=("metadata_probe_shutdown",),
+                    required_actions=(
+                        "store.stop",
+                        "store.metadata_probe",
+                        "proxy.disconnect",
+                    ),
+                    pending_actions=(
+                        "store.stop",
+                        "store.metadata_probe",
+                        "proxy.disconnect",
+                    ),
+                )
                 self._record_cleanup_outcome(_CleanupOutcome(report))
                 error = RuntimeAssemblyError("provider_cleanup_incomplete")
                 _attach_cleanup_report(error, report)
@@ -907,14 +1250,24 @@ class RunSession:
             try:
                 store_stopped = self._store._service_read_only_stopped is True
             except BaseException as error:
-                report = _cleanup_report(failed=("store_state",), pending=("store_state",))
+                report = _cleanup_report(
+                    failed=("store_state",),
+                    pending=("store_state",),
+                    required_actions=("store.stop", "proxy.disconnect"),
+                    confirmed_actions=("store.stop",),
+                    unknown_actions=("proxy.disconnect",),
+                )
                 self._record_cleanup_outcome(_CleanupOutcome(report))
                 _attach_cleanup_report(error, report)
                 if _is_control_interrupt(error):
                     raise
                 raise RuntimeAssemblyError("provider_cleanup_incomplete") from None
             if not store_stopped:
-                report = _cleanup_report(pending=("store_stop_unconfirmed",))
+                report = _cleanup_report(
+                    pending=("store_stop_unconfirmed",),
+                    required_actions=("store.stop", "proxy.disconnect"),
+                    pending_actions=("store.stop", "proxy.disconnect"),
+                )
                 self._record_cleanup_outcome(_CleanupOutcome(report))
                 error = RuntimeAssemblyError("provider_cleanup_incomplete")
                 _attach_cleanup_report(error, report)
@@ -922,20 +1275,35 @@ class RunSession:
         try:
             proxy_connected = self._proxy.is_connected
         except BaseException as error:
-            report = _cleanup_report(failed=("proxy_state",), pending=("proxy_state",))
+            report = _cleanup_report(
+                failed=("proxy_state",),
+                pending=("proxy_state",),
+                required_actions=("store.stop", "proxy.disconnect"),
+                confirmed_actions=("store.stop",),
+                unknown_actions=("proxy.disconnect",),
+            )
             self._record_cleanup_outcome(_CleanupOutcome(report))
             _attach_cleanup_report(error, report)
             if _is_control_interrupt(error):
                 raise
             raise RuntimeAssemblyError("provider_cleanup_incomplete") from None
         if proxy_connected is not False:
-            report = _cleanup_report(pending=("proxy_disconnect",))
+            report = _cleanup_report(
+                pending=("proxy_disconnect",),
+                required_actions=("store.stop", "proxy.disconnect"),
+                confirmed_actions=("store.stop",),
+                pending_actions=("proxy.disconnect",),
+            )
             self._record_cleanup_outcome(_CleanupOutcome(report))
             error = RuntimeAssemblyError("provider_cleanup_incomplete")
             _attach_cleanup_report(error, report)
             raise error
         outcome = _CleanupOutcome(
-            _cleanup_report(confirmed=("store_stop", "proxy_disconnect"))
+            _cleanup_report(
+                confirmed=("store_stop", "proxy_disconnect"),
+                required_actions=("store.stop", "proxy.disconnect"),
+                confirmed_actions=("store.stop", "proxy.disconnect"),
+            )
         )
         self._record_cleanup_outcome(outcome)
         self._mark_closed_after_cleanup(outcome)
@@ -985,7 +1353,12 @@ class RunSession:
         except BaseException:
             if exc_value is None:
                 raise
-            report = _cleanup_report(pending=("cleanup_state_unknown",))
+            report = _cleanup_report(
+                pending=("cleanup_state_unknown",),
+                scope="unknown",
+                required_actions=("cleanup.owner",),
+                unknown_actions=("cleanup.owner",),
+            )
             self._record_cleanup_outcome(_CleanupOutcome(report))
             _attach_cleanup_report(exc_value, report)
             return False
@@ -1119,7 +1492,7 @@ def assemble_run(
         cerebro.setbroker(broker)
         return RunSession(cerebro, store, broker, proxy, config)
     except BaseException as primary:
-        outcome = _disconnect_proxy(proxy)
+        outcome = _disconnect_proxy(proxy, scope="assembly_proxy")
         _attach_cleanup_report(primary, outcome.report)
         raise
 

@@ -27,7 +27,7 @@ references, static capability declaration, and strategy-parameter contract to
 one code-owned strategy class, feed set, and provider factory before invoking
 that factory.
 
-The current source candidate is version 0.1.8. It includes an optional
+The current source candidate is version 0.1.9. It includes an optional
 lazy-imported SDK read-only facade factory and resource owner; the Python 3.11+
 SDK remains absent from the runtime's required dependencies so ordinary
 package imports continue to support Python 3.9+.
@@ -167,13 +167,27 @@ exhaust by itself; callers must request a stop or wait for data.
 
 When startup, `run()`, or a `with` body already has a primary exception, a
 cleanup failure does not replace it. `RunSession.cleanup_report` (or the
-primary exception's `runtime_cleanup_report`) exposes only fixed cleanup step
-codes and confirmed/pending state, never exception text or configuration
-values. `complete` describes the latest cleanup outcome: it is false when that
-outcome has a failed step or unconfirmed state. A failed initial cleanup call
-may be followed by a confirmed owner-thread compensation retry, so the final
-report can be complete while the surfaced error still identifies that earlier
-cleanup failure. It is not remote provider/account proof. `GeneratorExit`,
+primary exception's `runtime_cleanup_report`) exposes a finite scope, required
+anonymous action ids, and fixed step/action outcomes, never exception text,
+feed names, or configuration values. An empty report or an unobserved required
+action is incomplete. A successful normal `run()` report has scope
+`run_session` and covers only the Store stopped state and the proxy disconnected
+state observed by this session. Cerebro owns normal Broker and Feed teardown;
+this report does not claim per-Broker, per-Feed, Strategy, or whole-Cerebro
+closure because this session receives no per-component normal-stop receipts.
+If this session itself performs compensation, each exact `BtApiFeed` stop has
+an anonymous stable id such as `feed.stop/0`; unsupported component types or
+unreadable feed state remain unknown/pending rather than being treated as
+inactive. `complete` means every required action in the declared scope was
+confirmed; it is a structural calculation over the report's supplied fields.
+`RuntimeCleanupReport` is a public value object callers can construct manually:
+scope, action ids, and statuses are not authenticated from source execution and
+do not prove account identity, permission, or authority. `unknown_actions` is a
+separate unresolved category; it need not also appear in `pending_actions`, but
+always prevents `complete`. A failed initial cleanup call may be followed by a
+confirmed owner-thread compensation retry, so the latest session report can be
+complete while the surfaced error retains its immutable earlier report.
+`GeneratorExit`,
 `KeyboardInterrupt`, and `SystemExit` from cleanup propagate when there is no
 earlier primary failure; otherwise the earlier failure remains authoritative.
 A partial `assemble_run`
@@ -183,11 +197,19 @@ when that exception exposes a writable instance dictionary with no conflicting
 exception is still preserved and no report is claimed to be observable. With
 an existing body exception, `__exit__` does not
 repeat cleanup already attempted by the session; an owner may explicitly retry
-`close()` afterward when the session remains open. A retry skips a Broker stop
-that this session previously observed returning successfully, while it retries
-an unconfirmed Store stop on the owner thread. If the Broker stop itself did not
-return, it remains retryable; a Store shutdown performed earlier by Cerebro but
-not observed in a session cleanup report is not treated as confirmed here.
+`close()` afterward when the session remains open. Before reusing a confirmed
+Broker stop, a retry re-reads the exact `BtApiBroker` `_live_started` boolean:
+`False` avoids a duplicate stop, while `True` triggers another owner-thread stop
+and must be observed `False` afterward. An unreadable or non-boolean state is
+unknown and incomplete. This private flag is only the Broker's current
+live-start observation, not a lifecycle generation or proof that no failed
+start was attempted. `BtApiBroker.start()` can reset it after hydration fails,
+while the Store remains connected; Store stopped state, proxy terminal state,
+and each required Feed action therefore remain separate obligations before
+this report can be complete. The Broker action does not prove account state or
+whole-Cerebro closure. If the Broker stop itself did not return, it remains
+retryable; a Store shutdown performed earlier by Cerebro but not observed in a
+session cleanup report is not treated as confirmed here.
 
 Backtrader does not enter its normal Strategy `_stop()` cleanup when a Strategy
 `_start()` fails before its main-loop `try` block. This candidate does not wrap

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import backtrader as bt
 import pytest
 from backtrader.brokers.btapibroker import BtApiBroker
+from backtrader.dataseries import TimeFrame
 from backtrader.feeds.btapifeed import BtApiFeed
 from backtrader.stores.btapistore import BtApiStore
 from backtrader.stores.service_read_proxy import (
@@ -1089,9 +1090,350 @@ def test_request_stop_before_run_is_explicitly_not_accepted():
     assert created[0][1].close_calls == 1
     assert created[0][2].close_calls == 1
     assert session.cleanup_report == RuntimeCleanupReport(
-        confirmed_steps=("store_stop", "proxy_disconnect")
+        confirmed_steps=("store_stop", "proxy_disconnect"),
+        scope="run_session",
+        required_actions=("store.stop", "proxy.disconnect"),
+        confirmed_actions=("store.stop", "proxy.disconnect"),
+    )
+    assert session.cleanup_report.scope == "run_session"
+    assert session.cleanup_report.required_actions == ("store.stop", "proxy.disconnect")
+    assert not any(
+        action.startswith(("broker.", "feed.stop/"))
+        for action in session.cleanup_report.required_actions
     )
     assert session.cleanup_report.complete is True
+
+
+def test_cleanup_report_requires_nonempty_and_fully_observed_actions():
+    empty = RuntimeCleanupReport()
+    missing_confirmation = RuntimeCleanupReport(
+        scope="run_session", required_actions=("store.stop",)
+    )
+
+    assert empty.complete is False
+    assert missing_confirmation.complete is False
+    assert RuntimeCleanupReport(
+        scope="run_session",
+        required_actions=("store.stop",),
+        confirmed_actions=("store.stop",),
+    ).complete is True
+
+
+def test_compensation_reports_each_feed_by_anonymous_id_and_marks_failure_pending():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    first_feed = session._cerebro.datas[0]
+    second_feed = BtApiFeed(
+        dataname="PRIVATE_SECOND_FEED",
+        store=session._store,
+        timeframe=TimeFrame.Minutes,
+        compression=1,
+        backfill_start=True,
+    )
+    session._cerebro.adddata(second_feed, name="PRIVATE_SECOND_FEED")
+    first_feed._session_active = True
+    second_feed._session_active = True
+    primary = RuntimeError("fixture run failure")
+
+    def stop_first_feed():
+        first_feed._session_active = False
+
+    def fail_second_feed_stop():
+        raise RuntimeError("PRIVATE_FEED_STOP_SENTINEL")
+
+    first_feed.stop = stop_first_feed
+    second_feed.stop = fail_second_feed_stop
+    session._cerebro.run = lambda: (_ for _ in ()).throw(primary)
+
+    with pytest.raises(RuntimeError) as caught:
+        session.run()
+
+    report = session.cleanup_report
+    assert caught.value is primary
+    assert caught.value.runtime_cleanup_report is report
+    assert "feed.stop/0" in report.required_actions
+    assert "feed.stop/1" in report.required_actions
+    assert "feed.stop/0" in report.confirmed_actions
+    assert report.failed_actions == ("feed.stop/1",)
+    assert report.pending_actions == ("feed.stop/1",)
+    assert report.complete is False
+    assert "PRIVATE_SECOND_FEED" not in repr(report)
+    assert "PRIVATE_FEED_STOP_SENTINEL" not in repr(report)
+
+
+def test_retry_keeps_removed_feed_identity_and_does_not_reuse_its_action_id():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    old_feed = session._cerebro.datas[0]
+    old_feed._session_active = True
+    old_stop_calls = []
+    replacement_stop_calls = []
+    primary = RuntimeError("fixture run failure")
+
+    def fail_once_then_stop_old_feed():
+        old_stop_calls.append("called")
+        if len(old_stop_calls) == 1:
+            raise RuntimeError("FIRST_FEED_STOP_SENTINEL")
+        old_feed._session_active = False
+
+    old_feed.stop = fail_once_then_stop_old_feed
+    session._cerebro.run = lambda: (_ for _ in ()).throw(primary)
+
+    with pytest.raises(RuntimeError) as caught:
+        session.run()
+
+    first_report = session.cleanup_report
+    old_action_id = "feed.stop/0"
+    assert caught.value.runtime_cleanup_report is first_report
+    assert old_action_id in first_report.required_actions
+    assert old_action_id in first_report.pending_actions
+    assert any(
+        component is old_feed and action_id == old_action_id
+        for component, action_id in session._component_action_bindings
+    )
+
+    session._cerebro.datas.clear()
+    session._cerebro.feeds.clear()
+    replacement = BtApiFeed(
+        dataname="PRIVATE_REPLACEMENT_FEED",
+        store=session._store,
+        timeframe=TimeFrame.Minutes,
+        compression=1,
+        backfill_start=True,
+    )
+    session._cerebro.adddata(replacement, name="PRIVATE_REPLACEMENT_FEED")
+    replacement._session_active = True
+
+    def stop_replacement_feed():
+        replacement_stop_calls.append("called")
+        replacement._session_active = False
+
+    replacement.stop = stop_replacement_feed
+    replacement_action_id = session._component_action_id(replacement)
+    assert replacement_action_id != old_action_id
+
+    session.close()
+
+    latest_report = session.cleanup_report
+    assert old_stop_calls == ["called", "called"]
+    assert replacement_stop_calls == ["called"]
+    assert caught.value.runtime_cleanup_report is first_report
+    assert first_report.complete is False
+    assert old_action_id in latest_report.required_actions
+    assert replacement_action_id in latest_report.required_actions
+    assert old_action_id in latest_report.confirmed_actions
+    assert replacement_action_id in latest_report.confirmed_actions
+    assert latest_report.complete is True
+    assert "PRIVATE_REPLACEMENT_FEED" not in repr(latest_report)
+
+
+def test_missing_binding_preserves_unresolved_removed_feed_as_unknown():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    feed = session._cerebro.datas[0]
+    feed._session_active = True
+    feed.stop = lambda: (_ for _ in ()).throw(RuntimeError("FEED_STOP_SENTINEL"))
+    session._cerebro.run = lambda: (_ for _ in ()).throw(RuntimeError("fixture run failure"))
+
+    with pytest.raises(RuntimeError):
+        session.run()
+
+    feed_action_id = "feed.stop/0"
+    assert feed_action_id in session.cleanup_report.required_actions
+    session._cerebro.datas.clear()
+    session._cerebro.feeds.clear()
+    session._component_action_bindings.clear()
+
+    with pytest.raises(RuntimeAssemblyError) as caught:
+        session.close()
+
+    report = session.cleanup_report
+    assert caught.value.code == "run_cleanup_failed"
+    assert feed_action_id in report.required_actions
+    assert feed_action_id in report.unknown_actions
+    assert feed_action_id not in report.pending_actions
+    assert report.complete is False
+    assert session._closed is False
+
+
+def test_removed_feed_with_prior_confirmation_is_not_stopped_again():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    feed = session._cerebro.datas[0]
+    feed._session_active = True
+    feed_stop_calls = []
+    broker_stop_calls = []
+    original_broker_stop = session._broker.stop
+    primary = RuntimeError("fixture run failure")
+
+    def stop_feed():
+        feed_stop_calls.append("called")
+        feed._session_active = False
+
+    def fail_broker_once():
+        broker_stop_calls.append("called")
+        if len(broker_stop_calls) == 1:
+            raise RuntimeError("BROKER_STOP_SENTINEL")
+        return original_broker_stop()
+
+    feed.stop = stop_feed
+    session._broker.stop = fail_broker_once
+    session._cerebro.run = lambda: (_ for _ in ()).throw(primary)
+
+    with pytest.raises(RuntimeError) as caught:
+        session.run()
+
+    first_report = session.cleanup_report
+    feed_action_id = "feed.stop/0"
+    assert caught.value.runtime_cleanup_report is first_report
+    assert first_report.failed_actions == ("broker.stop",)
+    assert feed_action_id in first_report.confirmed_actions
+    assert feed_stop_calls == ["called"]
+
+    session._cerebro.datas.clear()
+    session._cerebro.feeds.clear()
+    session.close()
+
+    latest_report = session.cleanup_report
+    assert broker_stop_calls == ["called", "called"]
+    assert feed_stop_calls == ["called"]
+    assert feed_action_id in latest_report.required_actions
+    assert feed_action_id in latest_report.confirmed_actions
+    assert latest_report.complete is True
+
+
+def test_removed_but_reactivated_confirmed_feed_is_stopped_again():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    feed = session._cerebro.datas[0]
+    feed._session_active = True
+    feed_stop_calls = []
+    broker_stop_calls = []
+    original_broker_stop = session._broker.stop
+    primary = RuntimeError("fixture run failure")
+
+    def stop_feed():
+        feed_stop_calls.append("called")
+        feed._session_active = False
+
+    def fail_broker_once():
+        broker_stop_calls.append("called")
+        if len(broker_stop_calls) == 1:
+            raise RuntimeError("BROKER_STOP_SENTINEL")
+        return original_broker_stop()
+
+    feed.stop = stop_feed
+    session._broker.stop = fail_broker_once
+    session._cerebro.run = lambda: (_ for _ in ()).throw(primary)
+
+    with pytest.raises(RuntimeError):
+        session.run()
+
+    feed_action_id = "feed.stop/0"
+    assert feed_action_id in session.cleanup_report.confirmed_actions
+    session._cerebro.datas.clear()
+    session._cerebro.feeds.clear()
+    feed._session_active = True
+
+    session.close()
+
+    assert feed_stop_calls == ["called", "called"]
+    assert broker_stop_calls == ["called", "called"]
+    assert feed_action_id in session.cleanup_report.confirmed_actions
+    assert session.cleanup_report.complete is True
+
+
+def test_missing_binding_for_previously_confirmed_feed_is_unknown():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    feed = session._cerebro.datas[0]
+    feed._session_active = True
+    feed_stop_calls = []
+    broker_stop_calls = []
+    original_broker_stop = session._broker.stop
+
+    def stop_feed():
+        feed_stop_calls.append("called")
+        feed._session_active = False
+
+    def fail_broker_once():
+        broker_stop_calls.append("called")
+        if len(broker_stop_calls) == 1:
+            raise RuntimeError("BROKER_STOP_SENTINEL")
+        return original_broker_stop()
+
+    feed.stop = stop_feed
+    session._broker.stop = fail_broker_once
+    session._cerebro.run = lambda: (_ for _ in ()).throw(RuntimeError("fixture run failure"))
+
+    with pytest.raises(RuntimeError):
+        session.run()
+
+    feed_action_id = "feed.stop/0"
+    assert feed_action_id in session.cleanup_report.confirmed_actions
+    session._cerebro.datas.clear()
+    session._cerebro.feeds.clear()
+    session._component_action_bindings.clear()
+
+    with pytest.raises(RuntimeAssemblyError) as caught:
+        session.close()
+
+    report = session.cleanup_report
+    assert caught.value.code == "run_cleanup_failed"
+    assert feed_stop_calls == ["called"]
+    assert broker_stop_calls == ["called", "called"]
+    assert feed_action_id in report.required_actions
+    assert feed_action_id in report.unknown_actions
+    assert report.complete is False
+    assert session._closed is False
+
+
+def test_unsupported_component_state_is_unknown_not_assumed_inactive():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    stop_calls = []
+    unsupported = SimpleNamespace(
+        dataname="PRIVATE_UNSUPPORTED_FEED", stop=lambda: stop_calls.append("called")
+    )
+    session._cerebro.datas.append(unsupported)
+    session._cerebro.run = lambda: (_ for _ in ()).throw(RuntimeError("fixture run failure"))
+
+    with pytest.raises(RuntimeError):
+        session.run()
+
+    report = session.cleanup_report
+    assert "component.stop/0" in report.required_actions
+    assert "component.stop/0" in report.unknown_actions
+    assert stop_calls == []
+    assert report.complete is False
+    assert "PRIVATE_UNSUPPORTED_FEED" not in repr(report)
+
+
+def test_missing_supported_feed_state_is_unknown_not_assumed_inactive():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    feed = session._cerebro.datas[0]
+    stop_calls = []
+    del feed._tick_consumer_claimed
+    feed.stop = lambda: stop_calls.append("called")
+    session._cerebro.run = lambda: (_ for _ in ()).throw(RuntimeError("fixture run failure"))
+
+    with pytest.raises(RuntimeError):
+        session.run()
+
+    report = session.cleanup_report
+    assert "feed.stop/0" in report.required_actions
+    assert "feed.stop/0" in report.unknown_actions
+    assert stop_calls == []
+    assert report.complete is False
 
 
 def test_run_preserves_primary_interrupt_when_base_exception_cleanup_fails_in_with():
@@ -1437,6 +1779,7 @@ def test_close_retry_skips_confirmed_broker_but_retries_unclosed_store():
     assert session.cleanup_report.pending_steps == (
         "store_stop_unconfirmed",
         "metadata_probe_shutdown",
+        "proxy_disconnect",
     )
     assert session._store._service_read_only_stopped is False
     assert proxy._closed is False
@@ -1453,6 +1796,7 @@ def test_close_retry_skips_confirmed_broker_but_retries_unclosed_store():
     assert session.cleanup_report.pending_steps == (
         "store_stop_unconfirmed",
         "metadata_probe_shutdown",
+        "proxy_disconnect",
     )
     assert proxy._closed is False
     assert account.close_calls == market.close_calls == 0
@@ -1469,6 +1813,132 @@ def test_close_retry_skips_confirmed_broker_but_retries_unclosed_store():
     assert session._closed is True
     assert proxy._closed is True
     assert account.close_calls == market.close_calls == 1
+
+
+def test_close_retry_retries_confirmed_broker_when_live_flag_is_reactivated():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    proxy, account, market = created[0]
+    original_broker_stop = session._broker.stop
+    broker_stop_calls = []
+    primary = RuntimeError("primary run failure")
+    pending_worker = threading.Thread(target=lambda: None)
+
+    def count_broker_stop():
+        broker_stop_calls.append("called")
+        return original_broker_stop()
+
+    def fail_engine_run():
+        raise primary
+
+    session._broker.stop = count_broker_stop
+    session._cerebro.run = fail_engine_run
+    with session._store._read_only_metadata_probe_condition:
+        session._store._read_only_metadata_probe_thread = pending_worker
+        session._store._read_only_metadata_probe_active = True
+
+    with pytest.raises(RuntimeError) as caught:
+        session.run()
+
+    first_report = session.cleanup_report
+    assert caught.value is primary
+    assert caught.value.runtime_cleanup_report is first_report
+    assert broker_stop_calls == ["called"]
+    assert "broker.stop" in first_report.confirmed_actions
+    assert first_report.complete is False
+    assert session._broker._live_started is False
+
+    # Model a later owner-thread Broker activation without invoking provider
+    # startup; the retry must observe and stop that exact controlled state.
+    session._broker._live_started = True
+    with session._store._read_only_metadata_probe_condition:
+        session._store._read_only_metadata_probe_active = False
+        session._store._read_only_metadata_probe_thread = None
+    session.close()
+
+    assert broker_stop_calls == ["called", "called"]
+    assert session._broker._live_started is False
+    assert session.cleanup_report.complete is True
+    assert session.cleanup_report is not first_report
+    assert first_report.complete is False
+    assert caught.value.runtime_cleanup_report is first_report
+    assert session._store._service_read_only_stopped is True
+    assert session._store.is_connected is False
+    assert proxy._closed is True
+    assert account.close_calls == market.close_calls == 1
+    assert session._closed is True
+
+
+@pytest.mark.parametrize("invalid_state", ("missing", "non_bool"))
+def test_close_retry_marks_unreadable_confirmed_broker_state_unknown(invalid_state):
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    proxy, account, market = created[0]
+    original_broker_stop = session._broker.stop
+    broker_stop_calls = []
+    primary = RuntimeError("primary run failure")
+    pending_worker = threading.Thread(target=lambda: None)
+
+    def count_broker_stop():
+        broker_stop_calls.append("called")
+        return original_broker_stop()
+
+    def fail_engine_run():
+        raise primary
+
+    session._broker.stop = count_broker_stop
+    session._cerebro.run = fail_engine_run
+    with session._store._read_only_metadata_probe_condition:
+        session._store._read_only_metadata_probe_thread = pending_worker
+        session._store._read_only_metadata_probe_active = True
+
+    with pytest.raises(RuntimeError) as caught:
+        session.run()
+
+    first_report = session.cleanup_report
+    assert caught.value.runtime_cleanup_report is first_report
+    assert "broker.stop" in first_report.confirmed_actions
+    assert first_report.complete is False
+
+    if invalid_state == "missing":
+        delattr(session._broker, "_live_started")
+    else:
+        session._broker._live_started = 1
+    with session._store._read_only_metadata_probe_condition:
+        session._store._read_only_metadata_probe_active = False
+        session._store._read_only_metadata_probe_thread = None
+
+    with pytest.raises(RuntimeAssemblyError) as close_error:
+        session.close()
+
+    unknown_report = session.cleanup_report
+    assert close_error.value.code == "run_cleanup_failed"
+    assert unknown_report is not first_report
+    assert first_report.complete is False
+    assert caught.value.runtime_cleanup_report is first_report
+    assert broker_stop_calls == ["called"]
+    assert "broker.stop" in unknown_report.required_actions
+    assert unknown_report.unknown_actions == ("broker.stop",)
+    assert "broker.stop" not in unknown_report.confirmed_actions
+    assert unknown_report.complete is False
+    assert session._store._service_read_only_stopped is True
+    assert session._store.is_connected is False
+    assert proxy._closed is True
+    assert account.close_calls == market.close_calls == 1
+    assert session._closed is False
+
+    session._broker._live_started = False
+    session.close()
+
+    assert broker_stop_calls == ["called", "called"]
+    assert session.cleanup_report.complete is True
+    assert session.cleanup_report.confirmed_actions == session.cleanup_report.required_actions
+    assert first_report.complete is False
+    assert unknown_report.complete is False
+    assert caught.value.runtime_cleanup_report is first_report
+    assert session._closed is True
 
 
 def test_close_retry_retries_unconfirmed_broker_and_finishes_owned_resources():
@@ -1510,22 +1980,35 @@ def test_close_retry_retries_unconfirmed_broker_and_finishes_owned_resources():
         session.run()
 
     assert caught.value is primary
+    failed_report = session.cleanup_report
+    assert caught.value.runtime_cleanup_report is failed_report
     assert broker_stop_calls == ["called"]
     assert store_stop_calls == ["called"]
     assert disconnect_calls == ["called"]
     assert session.cleanup_report.failed_steps == ("broker_stop",)
-    assert session.cleanup_report.confirmed_steps == ("store_stop",)
+    assert session.cleanup_report.failed_actions == ("broker.stop",)
+    assert session.cleanup_report.confirmed_steps == ("store_stop", "proxy_disconnect")
     assert session.cleanup_report.complete is False
     assert "BROKER_STOP_EXCEPTION_SENTINEL" not in repr(session.cleanup_report)
     assert session._closed is False
 
     session.close()
 
+    assert caught.value.runtime_cleanup_report is failed_report
+    assert failed_report.complete is False
+    assert failed_report.failed_actions == ("broker.stop",)
+    assert session.cleanup_report is not failed_report
     assert broker_stop_calls == ["called", "called"]
     assert store_stop_calls == ["called"]
     assert disconnect_calls == ["called"]
     assert session.cleanup_report.failed_steps == ()
-    assert session.cleanup_report.confirmed_steps == ("broker_stop", "store_stop")
+    assert session.cleanup_report.confirmed_steps == (
+        "broker_stop",
+        "store_stop",
+        "proxy_disconnect",
+    )
+    assert session.cleanup_report.required_actions == failed_report.required_actions
+    assert session.cleanup_report.confirmed_actions == failed_report.required_actions
     assert session.cleanup_report.complete is True
     assert session._store._service_read_only_stopped is True
     assert session._store.is_connected is False
@@ -1569,6 +2052,7 @@ def test_store_stop_and_mark_closed_failures_keep_only_finite_cleanup_state(monk
     created = []
     registry, routes = _runtime_bindings(created)
     session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    proxy, account, market = created[0]
     original_store_stop = session._store.stop
     stop_calls = []
 
@@ -1597,13 +2081,20 @@ def test_store_stop_and_mark_closed_failures_keep_only_finite_cleanup_state(monk
     assert caught.value.runtime_cleanup_report is session.cleanup_report
     assert session.cleanup_report.failed_steps == ("cleanup_state_unknown",)
     assert session.cleanup_report.pending_steps == ("cleanup_state_unknown",)
-    assert session.cleanup_report.confirmed_steps == ("broker_stop", "store_stop")
+    assert session.cleanup_report.confirmed_steps == (
+        "broker_stop",
+        "store_stop",
+        "proxy_disconnect",
+    )
     assert session._closed is False
+    assert session._store._service_read_only_stopped is True
+    assert proxy.is_connected is False
+    assert proxy._closed is True
     rendered = "".join(traceback.format_exception(caught.value))
     assert "STORE_EXCEPTION_SENTINEL" not in rendered
     assert "MARK_STATE_SENTINEL" not in rendered
-    assert created[0][1].close_calls == 1
-    assert created[0][2].close_calls == 1
+    assert account.close_calls == 1
+    assert market.close_calls == 1
 
 
 def test_close_propagates_control_if_mark_closed_fails_without_primary(monkeypatch):
