@@ -34,6 +34,8 @@ from bt_api_run_contract import (
     RunConfigError,
     TrustedRegistry,
     TrustedRoute,
+    ValidatedRunConfigV2,
+    parse_config,
 )
 
 from bt_api_runtime import (
@@ -366,6 +368,52 @@ def test_invalid_or_deferred_config_fails_before_provider_factory(source, expect
     with pytest.raises(RunConfigError) as caught:
         assemble_run(source, registry)
     assert caught.value.code == expected_code
+    assert created == []
+
+
+def test_valid_schema_v2_config_is_rejected_before_v1_provider_factory():
+    source = """\
+schema_version: 2
+mode: paper
+environment: paper
+references:
+  strategy: strategy/shared_observer
+  provider: provider/service_boundary
+  endpoint: endpoint/paper
+  account: account/paper
+  credential: credential/paper
+  scope: scope/paper
+  product: product/binance_usdm
+  data_source: data_source/market_feed
+  clock: clock/exchange_utc
+plugins:
+  gateway: false
+  risk: false
+  monitor: false
+  execution: false
+  runtime: false
+strategy_parameters:
+  window: 20
+  threshold: 0.5
+  use_filter: true
+requested_capabilities:
+  - market.read
+  - account.read
+"""
+    assert type(parse_config(source)) is ValidatedRunConfigV2
+
+    created = []
+    factory_calls = []
+
+    def counted_factory():
+        factory_calls.append(True)
+        return _factory("paper", created)()
+
+    registry, _routes = _runtime_bindings(created, paper_factory=counted_factory)
+    with pytest.raises((RunConfigError, RuntimeAssemblyError)):
+        assemble_run(source, registry)
+
+    assert factory_calls == []
     assert created == []
 
 

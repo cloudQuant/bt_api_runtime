@@ -2,13 +2,18 @@
 
 This directory is an independent build root for the `bt_api_run_contract`
 package. It has two explicitly versioned YAML schemas and depends at runtime only on
-PyYAML and the Python standard library. Package metadata is version `0.1.2` for
+PyYAML and the Python standard library. Package metadata is version `0.1.3` for
 this source candidate; this change is not a release.
 
 The 0.1.2 wheel was built and tested from separate target directories on
 Python 3.8 and 3.11 (47 tests each). The target checks used the existing
 interpreter environments and are not isolated dependency or release validation.
 Wheel SHA-256: `4cda8c352accda36321207c0c7bc642d9d80c105e1cedf4da9a4f6d5a5f4b27c`.
+
+The subsequent 0.1.3 wheel adds v2 static route resolution. Installed-target
+contract checks passed 56 tests each on Python 3.8 and 3.11; the environments
+were not isolated dependency or release checks. Wheel SHA-256:
+`498dfddebd85cb9b7ff4f32c44da0b35a8b0da82e3a559ad3e4ee31ccf0859d1`.
 
 Schema version 1 accepts `paper` and `live` configuration documents. The
 `mode` and `environment` must match. The names `replay` and `shadow` are
@@ -120,10 +125,22 @@ requested_capabilities:
 
 Paper and live require the matching `environment`. The parser recognizes
 `replay` and `shadow`, then rejects them with `mode_deferred`; those modes do
-not produce a DTO. `resolve_plan` also rejects every v2 DTO with
-`schema_v2_resolution_deferred`. Version 2 does not extend or alter the
-accepted version-1 `ResolvedPlan` tuple, and the static capability requests
-cannot authorize an operation.
+not produce a DTO. The same `resolve_plan` and `validate_plan` entries dispatch
+by exact DTO type. Version 1 keeps its original six-reference
+`TrustedRoute`/`TrustedRegistry` and eight-item `ResolvedPlan` tuple. Version 2
+uses separate `TrustedRouteV2`, `TrustedRegistryV2`, and `ResolvedPlanV2`
+types; its route binds the environment and all nine references as one exact
+bundle. Fields are never combined across routes.
+
+Deployment code owns each V2 route's `available_capabilities` and
+`strategy_parameter_contract` tuples; they accept plain data only and never
+call configuration-provided functions. `market.read` and `account.read`
+requests must be a subset of the exact route's declarations. Any
+`orders.*.write` request is `capability_resolution_deferred`, even if declared
+on that route. A resulting plan is only a static match and is not a permit;
+this runtime has no V2 write execution path. Enabled plugins remain
+`plugin_resolution_deferred`. V1 and V2 registries, configs, and plans cannot
+be mixed.
 
 `plugins` is required and retains at most 64 named boolean switches with the
 version-1 plugin-name grammar, including the gateway, risk, monitor, execution,
@@ -145,17 +162,26 @@ floats or other Python objects such as dates. These structural bounds do not
 replace validation by a strategy's parameter descriptor. The DTO and nested
 wrappers omit parameter values from their representations.
 
+The V2 route contract is a sorted tuple of `(name, kind, required)` entries,
+where `kind` is one of `null`, `bool`, `int`, `float`, `str`, `list`, or
+`map`. It rejects missing required names, unknown names, and top-level type
+mismatches using exact Python types (`bool` does not satisfy `int`). List/map
+contracts check only the top-level immutable wrapper type; their nested values
+are recursively copied and receive the parser's structural validation, not
+per-field strategy descriptor validation. No V2 strategy adapter is
+implemented. Do not pass immutable wrappers or this static plan to strategy
+execution.
+
 Call `ValidatedRunConfigV2.strategy_parameters_dict()` or a nested wrapper's
-`to_python()` for fresh ordinary dictionaries and lists. No v2 runtime adapter
-is implemented; the deferred resolver and strategy assembly must lower these
-copies through a reviewed descriptor path instead of passing immutable wrapper
-objects to a strategy.
+`to_python()` for fresh ordinary dictionaries and lists at a separately
+reviewed adapter boundary.
 
 `requested_capabilities` is a unique list of at most four values from
 `market.read`, `account.read`, `orders.paper.write`, and
 `orders.live.write`. A paper config cannot request live writes; a live config
-cannot request paper writes. This field records a request only. It does not
-grant permission, and no version-2 resolver or execution path is implemented.
+cannot request paper writes. This field records a request only. Reads are
+checked against static route declarations; writes remain deferred and are
+never returned in a plan. No version-2 execution path is implemented.
 
 Version 2 uses the same UTF-8 input bound (64 KiB), YAML event bound (8,192),
 and collection-depth bound (32) as version 1. Duplicate keys, aliases,
@@ -165,18 +191,21 @@ environment variables, or network services and does not import or execute a
 strategy, provider, plugin, or factory. V1 plugin fields and old schema-v4 or
 local-simulation fields are not migrated into version 2.
 
-The current registry contains symbolic strings only; it has no authoritative
-account, endpoint, credential, or strategy objects whose identities it could
-verify. Cross-environment reference separation checks identifier reuse, not
-the real-world meaning or safety of those identifiers. Environment identity,
-credential custody, provider compatibility, and order permission remain
-unverified and require a separate authoritative deployment contract.
+Both registries contain symbolic strings only; they have no authoritative
+account, endpoint, credential, provider, product, data-source, clock, or
+strategy objects whose identities they could verify. Cross-environment
+reference separation checks identifier reuse, not the real-world meaning or
+safety of those identifiers. Environment identity, credential custody,
+provider compatibility, and order permission remain unverified and require a
+separate authoritative deployment contract.
 
-Python object mechanics are not a security boundary. `ResolvedPlan` is a
-non-authoritative data result; its ordinary constructor is disabled and callers
-must recheck it with `validate_plan(plan, config, registry)` against the current
-injected registry before consuming it. That check reuses the config's plugin
-gate and proves only a static symbolic match.
+Python object mechanics are not a security boundary. `ResolvedPlan` and
+`ResolvedPlanV2` are non-authoritative data results; their ordinary
+constructors are disabled and callers must recheck with
+`validate_plan(plan, config, registry)` against the current injected registry
+before consuming one. This proves only a static symbolic match and rechecks
+the enabled-plugin gate, capability subset, and V2 top-level parameter
+contract.
 
 `parse_config` only accepts caller-provided `str` or UTF-8 `bytes`. It performs
 no file access, network access, provider import, strategy import, or execution.

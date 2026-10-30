@@ -16,9 +16,6 @@ _MESSAGES: Dict[str, str] = {
     "unknown_field": "Config contains an unknown field.",
     "invalid_schema_version": "Config schema version is invalid.",
     "unsupported_schema_version": "Config schema version is not supported.",
-    "schema_v2_resolution_deferred": (
-        "Schema version 2 resolution is deferred; no executable plan is produced."
-    ),
     "invalid_mode": "Config mode is invalid.",
     "mode_deferred": "This mode is recognized but deferred and cannot produce a run config.",
     "invalid_environment": "Config environment is invalid.",
@@ -60,6 +57,22 @@ _MESSAGES: Dict[str, str] = {
     ),
     "route_mismatch": "Run config references do not match the trusted route binding.",
     "plugin_resolution_deferred": "Enabled plugins cannot be resolved by this route registry.",
+    "capability_not_declared": (
+        "A requested read capability is not declared for the exact trusted route."
+    ),
+    "capability_resolution_deferred": (
+        "Write capability resolution is deferred; no executable plan is produced."
+    ),
+    "missing_strategy_parameter": (
+        "A required strategy parameter is missing from the static parameter contract."
+    ),
+    "unknown_strategy_parameter": (
+        "A strategy parameter is not declared by the static parameter contract."
+    ),
+    "strategy_parameter_type_mismatch": (
+        "A strategy parameter does not match its static top-level type contract."
+    ),
+    "plan_version_mismatch": "The plan and validated config schema versions do not match.",
 }
 
 

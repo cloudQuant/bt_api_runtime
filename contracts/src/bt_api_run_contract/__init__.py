@@ -28,7 +28,16 @@ from .parser import (
     ValidatedRunConfigV2,
     parse_config,
 )
-from .registry import ResolvedPlan, TrustedRegistry, TrustedRoute, resolve_plan, validate_plan
+from .registry import (
+    ResolvedPlan,
+    ResolvedPlanV2,
+    TrustedRegistry,
+    TrustedRegistryV2,
+    TrustedRoute,
+    TrustedRouteV2,
+    resolve_plan,
+    validate_plan,
+)
 
 __all__ = [
     "Environment",
@@ -50,10 +59,13 @@ __all__ = [
     "RunConfigError",
     "RunMode",
     "ResolvedPlan",
+    "ResolvedPlanV2",
     "SCHEMA_VERSION",
     "SCHEMA_V2_VERSION",
     "TrustedRegistry",
+    "TrustedRegistryV2",
     "TrustedRoute",
+    "TrustedRouteV2",
     "ValidatedRunConfig",
     "ValidatedRunConfigV2",
     "ReferencesV2",
