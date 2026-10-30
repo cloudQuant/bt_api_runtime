@@ -385,6 +385,14 @@ def _runtime_bindings_v2(created, factory_calls=None, *, paper_capabilities=None
                 factory_calls.append(environment)
             return create()
 
+        expected_route = paper if environment is Environment.PAPER else live
+
+        def preflight(selected_route):
+            return selected_route is expected_route
+
+        # This minimal hook exercises the generic V2 assembly contract only;
+        # SDK route mapping is covered by the real-factory source-fake tests.
+        factory.preflight = preflight
         return factory
 
     return RuntimeBindingsV2(
@@ -474,7 +482,16 @@ def _yaml_v2_config(
 
 def test_same_registered_strategy_runs_through_real_engine_in_paper_and_live():
     created = []
-    registry, routes = _runtime_bindings(created)
+    preflight_calls = []
+    paper_factory = _factory("paper", created)
+
+    def preflight(selected_route):
+        preflight_calls.append(selected_route)
+        return True
+
+    paper_factory.preflight = preflight
+    registry, routes = _runtime_bindings(created, paper_factory=paper_factory)
+    assert not hasattr(registry.bindings[1].provider_factory, "preflight")
     results = []
 
     for environment in (Environment.PAPER, Environment.LIVE):
@@ -492,6 +509,7 @@ def test_same_registered_strategy_runs_through_real_engine_in_paper_and_live():
         assert strategy.order.info.get("error_code") == "market_data_only"
 
     assert type(results[0]) is type(results[1]) is _ObserveAndAttemptBuy
+    assert preflight_calls == [routes[Environment.PAPER]]
     assert len(created) == 2
     for proxy, account, market in created:
         assert type(proxy) is ServiceReadProxy
@@ -609,6 +627,73 @@ def test_schema_v2_assembles_same_strategy_parameters_and_real_feed_in_paper_and
         assert market.close_calls == 1
         assert account.write_calls == []
         assert market.write_calls == []
+
+
+@pytest.mark.parametrize(
+    "factory_case",
+    (
+        "missing",
+        "noncallable",
+        "false",
+        "integer_one",
+        "hook_exception",
+        "lookup_exception",
+    ),
+)
+def test_schema_v2_requires_strict_successful_preflight_before_provider_factory(factory_case):
+    created = []
+    provider_calls = []
+    preflight_calls = []
+    route = _route_v2(Environment.PAPER)
+
+    class ProviderFactory:
+        def __call__(self):
+            provider_calls.append(True)
+            return _factory("paper", created)()
+
+    if factory_case == "lookup_exception":
+
+        class LookupFailureFactory(ProviderFactory):
+            @property
+            def preflight(self):
+                raise RuntimeError("private preflight lookup detail")
+
+        factory = LookupFailureFactory()
+    else:
+        factory = ProviderFactory()
+        if factory_case == "noncallable":
+            factory.preflight = 0
+        elif factory_case != "missing":
+
+            def preflight(selected_route):
+                preflight_calls.append(selected_route)
+                if factory_case == "false":
+                    return False
+                if factory_case == "integer_one":
+                    return 1
+                if factory_case == "hook_exception":
+                    raise RuntimeError("private preflight invocation detail")
+                return selected_route is route
+
+            factory.preflight = preflight
+
+    registry = RuntimeBindingsV2(
+        TrustedRegistryV2((route,)),
+        (RouteBindingV2(route, _ConfiguredObserver, (FeedSpec("BTC-USD"),), factory),),
+    )
+
+    with pytest.raises(RuntimeAssemblyError) as caught:
+        assemble_run(_yaml_v2_config(route), registry)
+
+    assert caught.value.code == "provider_binding_preflight_failed"
+    assert caught.value.__context__ is None
+    assert "private preflight" not in str(caught.value)
+    assert provider_calls == []
+    assert created == []
+    if factory_case in ("false", "integer_one", "hook_exception"):
+        assert preflight_calls == [route]
+    else:
+        assert preflight_calls == []
 
 
 @pytest.mark.parametrize(

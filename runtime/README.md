@@ -27,7 +27,7 @@ references, static capability declaration, and strategy-parameter contract to
 one code-owned strategy class, feed set, and provider factory before invoking
 that factory.
 
-The current source candidate is version 0.1.7. It includes an optional
+The current source candidate is version 0.1.8. It includes an optional
 lazy-imported SDK read-only facade factory and resource owner; the Python 3.11+
 SDK remains absent from the runtime's required dependencies so ordinary
 package imports continue to support Python 3.9+.
@@ -41,9 +41,14 @@ Configuration YAML contains symbolic selectors and, for v2, contract-validated
 strategy parameters; it cannot import strategy or provider modules or supply
 feed configuration. V2 requires an explicit request for both `market.read` and
 `account.read`; write requests and enabled plugins fail before the provider
-factory runs. V2 parameters are copied to ordinary Python values and passed as
-Strategy keyword arguments. There is no default SDK provider factory in this
-package. Runtime assembly requires a
+factory runs. Every V2 provider factory must expose a callable
+`preflight(selected_route)` hook that returns the singleton `True`; a missing
+or non-callable hook, a non-`True` result, or an ordinary lookup/call exception
+fails closed before the provider factory is invoked. V1 retains its prior
+zero-argument factory behavior, including support for factories without a
+preflight hook. V2 parameters are copied to ordinary Python values and passed
+as Strategy keyword arguments. There is no default SDK provider factory in
+this package. Runtime assembly requires a
 Backtrader build that exposes the public `ServiceReadProxy.supports_bar_history`
 capability API (available in source commit `0f88508d3`). The upstream distribution
 version remains `1.4.0` on both older and updated sources, so the package version
@@ -144,13 +149,14 @@ a later retry is not promised to repair it. The SDK has no general standalone
 close-receipt DTO, so these observations are derived from normal facade/runtime
 returns and the SDK's public uncertainty counters, not independent remote proof.
 
-The SDK factory exposes a public `preflight(selected_route)` hook which
-`assemble_run` calls after selecting the code-owned route and before calling
-the factory. Existing zero-argument factories without that hook remain
-compatible, but they do not receive this route-preflight guarantee. The hook
-checks selected-route/config consistency only; it is not an identity authority
-or authorization service. A trusted registry or deployment authority is still
-needed for formal provider/account identity and permission decisions.
+The SDK factory exposes the required public `preflight(selected_route)` hook,
+which `assemble_run` calls after selecting the code-owned route and before
+calling the factory. V2 factories without a callable hook, or whose hook does
+not return exactly `True`, fail closed before provider construction. V1 keeps
+its prior optional-hook behavior. Preflight checks selected-route/config
+consistency only; it is not an identity authority or authorization service. A
+trusted registry or deployment authority is still needed for formal
+provider/account identity and permission decisions.
 
 The session is bound to the thread that assembled it. `run()` and `close()`
 must use that owner thread because the proxy is thread-bound. Any thread may
@@ -211,9 +217,10 @@ and retry after a subscriber-close failure, and an unregister response loss
 that remains unconfirmed after retry. These tests do not verify
 effective transport timeout enforcement, real network cleanup, provider
 identity, source-descriptor truth, authorization, clock calibration, or account
-acceptance. Generic v2 factories without the SDK factory's `preflight` hook are
-kept compatible, but their selected-route and identity mappings are
-**NOT_PROVEN** by this composition.
+acceptance. Generic v2 factories need the same callable preflight contract, but
+their hook is only a local consistency check; selected-route correctness does
+not prove identity, authorization, or permission. The SDK source-fake path
+continues to exercise the real SDK factory and its real route-mapping checks.
 
 The intended source-checkout sequence is to install `bt_api_run_contract`,
 `bt_api_base`, and the required Backtrader build in the environment, then install

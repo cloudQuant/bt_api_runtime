@@ -816,11 +816,32 @@ def _single_stack_bindings(stack, strategy):
     )
 
 
-def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(tmp_path):
+def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(
+    tmp_path, monkeypatch
+):
     _SETUP_DIAGNOSTICS.clear()
     stacks = {}
     bindings, routes = _runtime_bindings(tmp_path, stacks)
     outcomes = []
+    factory_ids_after_preflight = set()
+    preflight_routes = []
+    preflight_before_factory = []
+    original_preflight = SdkReadOnlyFacadeFactory.preflight
+    original_call = SdkReadOnlyFacadeFactory.__call__
+
+    def observed_preflight(factory, selected_route):
+        result = original_preflight(factory, selected_route)
+        preflight_routes.append((id(factory), selected_route))
+        if result is True:
+            factory_ids_after_preflight.add(id(factory))
+        return result
+
+    def observed_call(factory):
+        preflight_before_factory.append(id(factory) in factory_ids_after_preflight)
+        return original_call(factory)
+
+    monkeypatch.setattr(SdkReadOnlyFacadeFactory, "preflight", observed_preflight)
+    monkeypatch.setattr(SdkReadOnlyFacadeFactory, "__call__", observed_call)
 
     for environment in (Environment.PAPER, Environment.LIVE):
         session = None
@@ -839,6 +860,12 @@ def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(tm
                         f"{phase}:{exception_type}:{safe_code}:{cleanup_state}"
                     ) from None
                 raise
+
+            stack = stacks[environment]
+            factory_id = id(stack["factory"])
+            assert preflight_routes[-1] == (factory_id, routes[environment])
+            assert preflight_before_factory[-1] is True
+            assert sum(item[0] == factory_id for item in preflight_routes) == 1
 
             def request_stop_at_deadline(
                 stop_requested=stop_requested,
@@ -1332,29 +1359,45 @@ def test_assemble_run_preflights_factory_against_selected_route(tmp_path):
     mismatched_stack["registry"].close()
 
 
-def test_assemble_run_propagates_preflight_keyboard_interrupt(tmp_path):
+@pytest.mark.parametrize("failure_phase", ("lookup", "call"))
+@pytest.mark.parametrize("interrupt_type", (GeneratorExit, KeyboardInterrupt, SystemExit))
+def test_assemble_run_propagates_preflight_process_control_signals(
+    tmp_path, failure_phase, interrupt_type
+):
     route = _route(Environment.PAPER)
-    marker = KeyboardInterrupt("synthetic preflight interrupt")
+    marker = interrupt_type("synthetic preflight control")
 
-    class InterruptingFactory:
+    class FactoryWithoutInterruptingHook:
         def __init__(self):
             self.calls = 0
-
-        def preflight(self, selected_route):
-            assert selected_route == route
-            raise marker
 
         def __call__(self):
             self.calls += 1
             raise AssertionError("provider factory ran after interrupted preflight")
 
-    factory = InterruptingFactory()
+    if failure_phase == "lookup":
+
+        class InterruptingLookupFactory(FactoryWithoutInterruptingHook):
+            @property
+            def preflight(self):
+                raise marker
+
+        factory = InterruptingLookupFactory()
+    else:
+
+        class InterruptingCallFactory(FactoryWithoutInterruptingHook):
+            def preflight(self, selected_route):
+                assert selected_route == route
+                raise marker
+
+        factory = InterruptingCallFactory()
+
     bindings = RuntimeBindingsV2(
         TrustedRegistryV2((route,)),
         (RouteBindingV2(route, _SameStrategy, (FeedSpec(_DATA_NAME),), factory),),
     )
 
-    with pytest.raises(KeyboardInterrupt) as error:
+    with pytest.raises(interrupt_type) as error:
         assemble_run(_run_config(route), bindings)
 
     assert error.value is marker

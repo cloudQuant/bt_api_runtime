@@ -17,9 +17,14 @@ do not prove which endpoint, account, credentials, provider, or permissions a
 factory actually uses. Generic application-supplied factories remain a
 deployment trust boundary and must return a fresh Backtrader `ServiceReadProxy`;
 the application owns any SDK runtime shared by those factories. The runtime also
-provides an optional, code-owned `SdkReadOnlyFacadeFactory` for one v2 route. Its
-`preflight(selected_route)` checks route/config consistency before factory I/O.
-Its resource owner retains the SDK runtime, account and market facades, and proxy;
+provides an optional, code-owned `SdkReadOnlyFacadeFactory` for one v2 route.
+Every schema-v2 provider factory must expose a callable
+`preflight(selected_route)` hook returning exactly
+`True`; missing/non-callable hooks, rejected values, and ordinary lookup/call
+exceptions fail closed before invoking that factory. Schema v1 keeps its prior
+optional-hook behavior and accepts a legacy factory without one. Preflight is
+only a consistency check, not identity or permission proof. The resource owner
+retains the SDK runtime, account and market facades, and proxy;
 after the session closes the per-run proxy, the application calls
 `factory.owner.close()` to finish that owner's cleanup.
 

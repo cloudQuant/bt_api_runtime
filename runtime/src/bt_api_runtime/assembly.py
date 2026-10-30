@@ -155,6 +155,35 @@ def _is_control_interrupt(error: BaseException) -> bool:
     return isinstance(error, (GeneratorExit, KeyboardInterrupt, SystemExit))
 
 
+def _preflight_v2_provider_factory(
+    provider_factory: object, selected_route: TrustedRouteV2
+) -> None:
+    """Require a finite successful preflight before invoking a v2 provider factory."""
+    failed = False
+    try:
+        preflight = getattr(provider_factory, "preflight", None)
+    except BaseException as error:
+        if _is_control_interrupt(error):
+            raise
+        failed = True
+        preflight = None
+
+    if not failed and callable(preflight):
+        try:
+            result = preflight(selected_route)
+        except BaseException as error:
+            if _is_control_interrupt(error):
+                raise
+            failed = True
+        else:
+            failed = result is not True
+    else:
+        failed = True
+
+    if failed:
+        raise RuntimeAssemblyError("provider_binding_preflight_failed") from None
+
+
 def _disconnect_proxy(proxy: ServiceReadProxy) -> _CleanupOutcome:
     failed = []
     pending = []
@@ -1012,23 +1041,23 @@ def assemble_run(
             raise RuntimeAssemblyError("invalid_strategy_parameters")
     else:  # parse_config currently returns only these two exact DTO types.
         raise RuntimeAssemblyError("unsupported_config_version")
-    # Provider factories that expose a public preflight hook can bind their
-    # route/config map to the exact route selected above. This hook runs before
-    # the factory itself, so the SDK-owned factory can reject a mismatched
-    # symbolic route before transport or registration starts. Legacy factories
-    # without the hook retain their zero-argument contract and do not receive
-    # this preflight guarantee. In either case this is consistency checking,
-    # not provider identity or authorization.
-    preflight = getattr(binding.provider_factory, "preflight", None)
-    if callable(preflight):
-        preflight_failed = False
-        preflight_result = None
-        try:
-            preflight_result = preflight(binding.route)
-        except Exception:  # noqa: BLE001 - expose only the finite preflight boundary code
-            preflight_failed = True
-        if preflight_failed or preflight_result is not True:
-            raise RuntimeAssemblyError("provider_binding_preflight_failed") from None
+    # V2 requires the code-owned factory to confirm the selected route before
+    # provider resources can be created. This is a consistency check, not
+    # provider identity or authorization. V1 keeps its legacy optional-hook
+    # behavior and zero-argument factory contract.
+    if type(config) is ValidatedRunConfigV2:
+        _preflight_v2_provider_factory(binding.provider_factory, binding.route)
+    else:
+        preflight = getattr(binding.provider_factory, "preflight", None)
+        if callable(preflight):
+            preflight_failed = False
+            preflight_result = None
+            try:
+                preflight_result = preflight(binding.route)
+            except Exception:  # noqa: BLE001 - preserve the V1 hook behavior
+                preflight_failed = True
+            if preflight_failed or preflight_result is not True:
+                raise RuntimeAssemblyError("provider_binding_preflight_failed") from None
     if not callable(getattr(ServiceReadProxy, "supports_bar_history", None)):
         raise RuntimeAssemblyError("backtrader_bar_history_capability_unavailable")
 
