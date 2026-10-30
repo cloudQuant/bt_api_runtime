@@ -2,7 +2,7 @@
 
 This directory is an independent build root for the `bt_api_run_contract`
 package. It has two explicitly versioned YAML schemas and depends at runtime only on
-PyYAML and the Python standard library. Package metadata is version `0.1.3` for
+PyYAML and the Python standard library. Package metadata is version `0.1.4` for
 this source candidate; this change is not a release.
 
 The 0.1.2 wheel was built and tested from separate target directories on
@@ -14,6 +14,11 @@ The subsequent 0.1.3 wheel adds v2 static route resolution. Installed-target
 contract checks passed 56 tests each on Python 3.8 and 3.11; the environments
 were not isolated dependency or release checks. Wheel SHA-256:
 `498dfddebd85cb9b7ff4f32c44da0b35a8b0da82e3a559ad3e4ee31ccf0859d1`.
+
+The 0.1.4 wheel updates the parser documentation; installed-target checks
+passed 56 tests each on Python 3.8 and 3.11 using existing interpreter
+environments. Wheel SHA-256:
+`bf02fec88e160c05e528b9c1fee6ef939e37ae3ed10dce3186bc716f18bf0ab9`.
 
 Schema version 1 accepts `paper` and `live` configuration documents. The
 `mode` and `environment` must match. The names `replay` and `shadow` are
@@ -217,9 +222,9 @@ no automatic legacy `paper` mapping.
 
 The returned `ValidatedRunConfig` and all nested values are immutable. It is a
 pure-data candidate, not an authorized or resolved execution plan. This source
-package and its fake/boundary tests do not establish an installed consumer,
-provider integration, external paper-account acceptance, or live-write
-authorization.
+package and its fake/boundary tests do not establish an isolated consumer with
+complete dependency resolution, provider integration, external paper-account
+acceptance, or live-write authorization.
 
 Run the focused tests from this directory with:
 

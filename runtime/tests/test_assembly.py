@@ -31,9 +31,12 @@ from bt_api_base.service_protocol import WireScope
 from bt_api_run_contract import (
     Environment,
     References,
+    ReferencesV2,
     RunConfigError,
     TrustedRegistry,
+    TrustedRegistryV2,
     TrustedRoute,
+    TrustedRouteV2,
     ValidatedRunConfigV2,
     parse_config,
 )
@@ -41,8 +44,10 @@ from bt_api_run_contract import (
 from bt_api_runtime import (
     FeedSpec,
     RouteBinding,
+    RouteBindingV2,
     RuntimeAssemblyError,
     RuntimeBindings,
+    RuntimeBindingsV2,
     assemble_run,
 )
 
@@ -181,6 +186,32 @@ class _ObserveAndAttemptBuy(bt.Strategy):
         self.env.runstop()
 
 
+class _ConfiguredObserver(bt.Strategy):
+    params = (
+        ("enabled", None),
+        ("labels", None),
+        ("nullable", "default"),
+        ("options", None),
+        ("threshold", None),
+        ("window", None),
+    )
+
+    def __init__(self):
+        self.received_parameters = {
+            "enabled": self.p.enabled,
+            "labels": self.p.labels,
+            "nullable": self.p.nullable,
+            "options": self.p.options,
+            "threshold": self.p.threshold,
+            "window": self.p.window,
+        }
+        self.closes = []
+
+    def next(self):
+        self.closes.append(float(self.data.close[0]))
+        self.env.runstop()
+
+
 def _resource_clients(environment, *, binding_kind="bar", wire_timeframe="1m"):
     # These labels are deliberately fixture-only and do not assert a real venue.
     account = AccountKey("fixture-provider", "spot", "fixture-" + environment, "fixture-account")
@@ -302,6 +333,62 @@ def _runtime_bindings(created, *, feed_spec=None, paper_factory=None, live_facto
     ), {Environment.PAPER: paper, Environment.LIVE: live}
 
 
+_V2_PARAMETER_CONTRACT = (
+    ("enabled", "bool", True),
+    ("labels", "list", True),
+    ("nullable", "null", True),
+    ("options", "map", True),
+    ("threshold", "float", True),
+    ("window", "int", True),
+)
+
+
+def _route_v2(environment, *, capabilities=("account.read", "market.read")):
+    suffix = environment.value
+    return TrustedRouteV2(
+        environment,
+        ReferencesV2(
+            strategy="strategy/shared_configured_observer",
+            provider="provider/service_boundary",
+            endpoint="endpoint/" + suffix,
+            account="account/" + suffix,
+            credential="credential/" + suffix,
+            scope="scope/" + suffix,
+            product="product/binance_usdm",
+            data_source="data_source/market_feed",
+            clock="clock/exchange_utc",
+        ),
+        tuple(capabilities),
+        _V2_PARAMETER_CONTRACT,
+    )
+
+
+def _runtime_bindings_v2(created, factory_calls=None, *, paper_capabilities=None):
+    paper_capabilities = paper_capabilities or ("account.read", "market.read")
+    paper = _route_v2(Environment.PAPER, capabilities=paper_capabilities)
+    live = _route_v2(Environment.LIVE)
+    contract_registry = TrustedRegistryV2((paper, live))
+    feeds = (FeedSpec("BTC-USD"),)
+
+    def counted_factory(environment):
+        create = _factory(environment.value, created)
+
+        def factory():
+            if factory_calls is not None:
+                factory_calls.append(environment)
+            return create()
+
+        return factory
+
+    return RuntimeBindingsV2(
+        contract_registry,
+        (
+            RouteBindingV2(paper, _ConfiguredObserver, feeds, counted_factory(Environment.PAPER)),
+            RouteBindingV2(live, _ConfiguredObserver, feeds, counted_factory(Environment.LIVE)),
+        ),
+    ), {Environment.PAPER: paper, Environment.LIVE: live}
+
+
 def _yaml_config(route, *, mode=None, environment=None, plugins="{}", extra=""):
     refs = route.references
     mode = mode or route.environment.value
@@ -320,6 +407,61 @@ def _yaml_config(route, *, mode=None, environment=None, plugins="{}", extra=""):
     lines.append("plugins: " + plugins)
     if extra:
         lines.append(extra)
+    return "\n".join(lines) + "\n"
+
+
+def _yaml_v2_config(
+    route,
+    *,
+    mode=None,
+    environment=None,
+    capabilities=("account.read", "market.read"),
+    plugins="{gateway: false, risk: false, monitor: false, execution: false, runtime: false}",
+    parameters=None,
+    references_override=None,
+):
+    refs = route.references
+    mode = mode or route.environment.value
+    environment = environment or route.environment.value
+    reference_values = {
+        name: getattr(refs, name)
+        for name in (
+            "strategy",
+            "provider",
+            "endpoint",
+            "account",
+            "credential",
+            "scope",
+            "product",
+            "data_source",
+            "clock",
+        )
+    }
+    if references_override:
+        reference_values.update(references_override)
+    parameter_lines = parameters if parameters is not None else [
+        "  enabled: true",
+        "  labels: [primary, null]",
+        "  nullable: null",
+        "  options:",
+        "    nested:",
+        "      count: 2",
+        "      tags: [a, b]",
+        "  threshold: 0.5",
+        "  window: 20",
+    ]
+    lines = [
+        "schema_version: 2",
+        "mode: " + mode,
+        "environment: " + environment,
+        "references:",
+    ]
+    lines.extend(f"  {name}: {value}" for name, value in reference_values.items())
+    lines.append("plugins: " + plugins)
+    lines.append("strategy_parameters:")
+    lines.extend(parameter_lines)
+    lines.append("requested_capabilities:")
+    lines.extend("  - " + capability for capability in capabilities)
     return "\n".join(lines) + "\n"
 
 
@@ -410,10 +552,194 @@ requested_capabilities:
         return _factory("paper", created)()
 
     registry, _routes = _runtime_bindings(created, paper_factory=counted_factory)
-    with pytest.raises((RunConfigError, RuntimeAssemblyError)):
+    with pytest.raises(RuntimeAssemblyError) as caught:
         assemble_run(source, registry)
 
+    assert caught.value.code == "invalid_runtime_registry"
     assert factory_calls == []
+    assert created == []
+
+
+def test_schema_v2_assembles_same_strategy_parameters_and_real_feed_in_paper_and_live():
+    created = []
+    factory_calls = []
+    registry, routes = _runtime_bindings_v2(created, factory_calls)
+    received = []
+
+    for environment in (Environment.PAPER, Environment.LIVE):
+        source = _yaml_v2_config(routes[environment])
+        assert isinstance(parse_config(source), ValidatedRunConfigV2)
+        session = assemble_run(source, registry)
+        assert session.environment is environment
+        (strategy,) = session.run()
+        assert type(strategy) is _ConfiguredObserver
+        assert type(strategy.broker) is BtApiBroker
+        assert type(strategy.broker.store) is BtApiStore
+        assert type(strategy.datas[0]) is BtApiFeed
+        assert strategy.closes == [100.5]
+        assert strategy.received_parameters == {
+            "enabled": True,
+            "labels": ["primary", None],
+            "nullable": None,
+            "options": {"nested": {"count": 2, "tags": ["a", "b"]}},
+            "threshold": 0.5,
+            "window": 20,
+        }
+        assert type(strategy.received_parameters["labels"]) is list
+        assert type(strategy.received_parameters["options"]) is dict
+        assert type(strategy.received_parameters["options"]["nested"]["tags"]) is list
+        received.append(strategy.received_parameters)
+
+    assert received[0] == received[1]
+    assert factory_calls == [Environment.PAPER, Environment.LIVE]
+    assert len(created) == 2
+    for proxy, account, market in created:
+        assert type(proxy) is ServiceReadProxy
+        assert proxy.is_connected is False
+        assert account.refresh_calls == 1
+        assert account.close_calls == 1
+        assert market.history_calls == 1
+        assert market.close_calls == 1
+        assert account.write_calls == []
+        assert market.write_calls == []
+
+
+@pytest.mark.parametrize(
+    "options, expected_code",
+    [
+        ({"capabilities": ("market.read",)}, "required_read_capability_missing"),
+        ({"capabilities": ("account.read",)}, "required_read_capability_missing"),
+        (
+            {
+                "capabilities": (
+                    "account.read",
+                    "market.read",
+                    "orders.paper.write",
+                )
+            },
+            "capability_resolution_deferred",
+        ),
+        (
+            {
+                "plugins": "{gateway: false, risk: true, monitor: false, execution: false, runtime: false}"
+            },
+            "plugin_resolution_deferred",
+        ),
+        (
+            {"references_override": {"product": "product/unknown"}},
+            "route_mismatch",
+        ),
+        ({"mode": "live"}, "environment_mismatch"),
+        (
+            {
+                "parameters": [
+                    "  enabled: true",
+                    "  labels: [primary, null]",
+                    "  nullable: null",
+                    "  options:",
+                    "    nested:",
+                    "      count: 2",
+                    "      tags: [a, b]",
+                    "  threshold: 0.5",
+                    '  window: "20"',
+                ]
+            },
+            "strategy_parameter_type_mismatch",
+        ),
+        (
+            {
+                "parameters": [
+                    "  enabled: true",
+                    "  extra: 1",
+                    "  labels: [primary, null]",
+                    "  nullable: null",
+                    "  options:",
+                    "    nested:",
+                    "      count: 2",
+                    "      tags: [a, b]",
+                    "  threshold: 0.5",
+                    "  window: 20",
+                ]
+            },
+            "unknown_strategy_parameter",
+        ),
+        (
+            {
+                "parameters": [
+                    "  enabled: true",
+                    "  labels: [primary, null]",
+                    "  nullable: null",
+                    "  options:",
+                    "    nested:",
+                    "      count: 2",
+                    "      tags: [a, b]",
+                    "  threshold: 0.5",
+                ]
+            },
+            "missing_strategy_parameter",
+        ),
+    ],
+)
+def test_schema_v2_rejects_capability_plugin_route_mode_and_parameter_mismatches_before_factory(
+    options, expected_code
+):
+    created = []
+    factory_calls = []
+    registry, routes = _runtime_bindings_v2(created, factory_calls)
+    source = _yaml_v2_config(routes[Environment.PAPER], **options)
+
+    with pytest.raises((RunConfigError, RuntimeAssemblyError)) as caught:
+        assemble_run(source, registry)
+
+    assert caught.value.code == expected_code
+    assert factory_calls == []
+    assert created == []
+
+
+def test_schema_v2_requires_the_code_route_to_declare_both_read_capabilities():
+    created = []
+    factory_calls = []
+    registry, routes = _runtime_bindings_v2(
+        created,
+        factory_calls,
+        paper_capabilities=("account.read",),
+    )
+
+    with pytest.raises(RunConfigError) as caught:
+        assemble_run(_yaml_v2_config(routes[Environment.PAPER]), registry)
+
+    assert caught.value.code == "capability_not_declared"
+    assert factory_calls == []
+    assert created == []
+
+
+def test_schema_v2_same_strategy_reference_cannot_bind_different_classes_by_mode():
+    created = []
+    _registry, routes = _runtime_bindings_v2(created)
+
+    class _OtherConfiguredObserver(_ConfiguredObserver):
+        pass
+
+    with pytest.raises(RuntimeAssemblyError) as caught:
+        RuntimeBindingsV2(
+            TrustedRegistryV2((routes[Environment.PAPER], routes[Environment.LIVE])),
+            (
+                RouteBindingV2(
+                    routes[Environment.PAPER],
+                    _ConfiguredObserver,
+                    (FeedSpec("BTC-USD"),),
+                    _factory("paper", created),
+                ),
+                RouteBindingV2(
+                    routes[Environment.LIVE],
+                    _OtherConfiguredObserver,
+                    (FeedSpec("BTC-USD"),),
+                    _factory("live", created),
+                ),
+            ),
+        )
+
+    assert caught.value.code == "strategy_binding_mismatch"
     assert created == []
 
 

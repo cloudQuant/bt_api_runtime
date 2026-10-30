@@ -23,17 +23,34 @@ from backtrader.strategy import Strategy
 from bt_api_run_contract import (
     Environment,
     References,
+    ReferencesV2,
     ResolvedPlan,
+    ResolvedPlanV2,
     RunConfigError,
     TrustedRegistry,
+    TrustedRegistryV2,
     TrustedRoute,
+    TrustedRouteV2,
     ValidatedRunConfig,
+    ValidatedRunConfigV2,
     parse_config,
     resolve_plan,
     validate_plan,
 )
 
 _REFERENCE_FIELDS = ("strategy", "provider", "endpoint", "account", "credential", "scope")
+_REFERENCE_FIELDS_V2 = (
+    "strategy",
+    "provider",
+    "endpoint",
+    "account",
+    "credential",
+    "scope",
+    "product",
+    "data_source",
+    "clock",
+)
+_REQUIRED_V2_READ_CAPABILITIES = frozenset(("market.read", "account.read"))
 _SUPPORTED_MARKET_TIMEFRAME = "1m"
 
 
@@ -74,6 +91,19 @@ class RouteBinding:
         _validate_route_binding(self)
 
 
+@dataclass(frozen=True)
+class RouteBindingV2:
+    """Code-owned strategy, feed, and provider factory for one v2 route."""
+
+    route: TrustedRouteV2
+    strategy_class: type
+    feeds: tuple[FeedSpec, ...]
+    provider_factory: Callable[[], ServiceReadProxy]
+
+    def __post_init__(self) -> None:
+        _validate_route_binding_v2(self)
+
+
 class RuntimeBindings:
     """Pair every contract route with exactly one code-owned runtime binding."""
 
@@ -102,12 +132,55 @@ class RuntimeBindings:
         return f"RuntimeBindings(route_count={len(self.bindings)!r})"
 
 
+class RuntimeBindingsV2:
+    """Pair every v2 contract route with one complete code-owned binding."""
+
+    __slots__ = ("_bindings", "_contract_registry")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("RuntimeBindingsV2 cannot be subclassed")
+
+    def __init__(
+        self,
+        contract_registry: TrustedRegistryV2,
+        bindings: tuple[RouteBindingV2, ...],
+    ) -> None:
+        object.__setattr__(self, "_contract_registry", contract_registry)
+        object.__setattr__(self, "_bindings", bindings)
+        _runtime_registry_v2_parts(self)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("RuntimeBindingsV2 is immutable")
+
+    @property
+    def contract_registry(self) -> TrustedRegistryV2:
+        return object.__getattribute__(self, "_contract_registry")
+
+    @property
+    def bindings(self) -> tuple[RouteBindingV2, ...]:
+        return object.__getattribute__(self, "_bindings")
+
+    def __repr__(self) -> str:
+        return f"RuntimeBindingsV2(route_count={len(self.bindings)!r})"
+
+
 def _references_tuple(references: References) -> tuple[str, ...]:
     if type(references) is not References:
         raise RuntimeAssemblyError("invalid_route_references")
     try:
         values = tuple(object.__getattribute__(references, name) for name in _REFERENCE_FIELDS)
         References(*values)
+    except (AttributeError, IndexError, TypeError, RunConfigError):
+        raise RuntimeAssemblyError("invalid_route_references") from None
+    return values
+
+
+def _references_tuple_v2(references: ReferencesV2) -> tuple[str, ...]:
+    if type(references) is not ReferencesV2:
+        raise RuntimeAssemblyError("invalid_route_references")
+    try:
+        values = tuple(object.__getattribute__(references, name) for name in _REFERENCE_FIELDS_V2)
+        ReferencesV2(*values)
     except (AttributeError, IndexError, TypeError, RunConfigError):
         raise RuntimeAssemblyError("invalid_route_references") from None
     return values
@@ -124,6 +197,25 @@ def _route_key(route: TrustedRoute) -> tuple[Environment, tuple[str, ...]]:
     if type(environment) is not Environment:
         raise RuntimeAssemblyError("invalid_route_binding")
     return environment, _references_tuple(references)
+
+
+def _route_key_v2(
+    route: TrustedRouteV2,
+) -> tuple[Environment, tuple[str, ...], tuple[str, ...], tuple[tuple[str, str, bool], ...]]:
+    if type(route) is not TrustedRouteV2:
+        raise RuntimeAssemblyError("invalid_route_binding")
+    try:
+        environment = route.environment
+        references = route.references
+        capabilities = route.available_capabilities
+        parameter_contract = route.strategy_parameter_contract
+    except (AttributeError, RunConfigError):
+        raise RuntimeAssemblyError("invalid_route_binding") from None
+    if type(environment) is not Environment:
+        raise RuntimeAssemblyError("invalid_route_binding")
+    if type(capabilities) is not tuple or type(parameter_contract) is not tuple:
+        raise RuntimeAssemblyError("invalid_route_binding")
+    return environment, _references_tuple_v2(references), capabilities, parameter_contract
 
 
 def _validate_feed_specs(feeds: object) -> tuple[FeedSpec, ...]:
@@ -151,6 +243,31 @@ def _validate_route_binding(binding: object) -> RouteBinding:
     except AttributeError:
         raise RuntimeAssemblyError("invalid_route_binding") from None
     _route_key(route)
+    if type(strategy_class) is not type:
+        raise RuntimeAssemblyError("invalid_strategy_binding")
+    try:
+        is_strategy = issubclass(strategy_class, Strategy)
+    except TypeError:
+        is_strategy = False
+    if not is_strategy:
+        raise RuntimeAssemblyError("invalid_strategy_binding")
+    _validate_feed_specs(feeds)
+    if not callable(provider_factory):
+        raise RuntimeAssemblyError("invalid_provider_factory")
+    return binding
+
+
+def _validate_route_binding_v2(binding: object) -> RouteBindingV2:
+    if type(binding) is not RouteBindingV2:
+        raise RuntimeAssemblyError("invalid_route_binding")
+    try:
+        route = object.__getattribute__(binding, "route")
+        strategy_class = object.__getattribute__(binding, "strategy_class")
+        feeds = object.__getattribute__(binding, "feeds")
+        provider_factory = object.__getattribute__(binding, "provider_factory")
+    except AttributeError:
+        raise RuntimeAssemblyError("invalid_route_binding") from None
+    _route_key_v2(route)
     if type(strategy_class) is not type:
         raise RuntimeAssemblyError("invalid_strategy_binding")
     try:
@@ -200,12 +317,71 @@ def _runtime_registry_parts(
     return contract_registry, bindings
 
 
+def _runtime_registry_v2_parts(
+    registry: object,
+) -> tuple[TrustedRegistryV2, tuple[RouteBindingV2, ...]]:
+    if type(registry) is not RuntimeBindingsV2:
+        raise RuntimeAssemblyError("invalid_runtime_registry")
+    try:
+        contract_registry = object.__getattribute__(registry, "_contract_registry")
+        bindings = object.__getattribute__(registry, "_bindings")
+    except AttributeError:
+        raise RuntimeAssemblyError("invalid_runtime_registry") from None
+    if type(contract_registry) is not TrustedRegistryV2:
+        raise RuntimeAssemblyError("invalid_runtime_registry")
+    try:
+        contract_routes = contract_registry.routes
+    except (AttributeError, RunConfigError, TypeError):
+        raise RuntimeAssemblyError("invalid_runtime_registry") from None
+    if type(bindings) is not tuple or len(bindings) != len(contract_routes):
+        raise RuntimeAssemblyError("route_binding_mismatch")
+    strategy_classes = {}
+    runtime_routes = []
+    for binding in bindings:
+        _validate_route_binding_v2(binding)
+        route = object.__getattribute__(binding, "route")
+        key = _route_key_v2(route)
+        strategy_reference = key[1][0]
+        previous_class = strategy_classes.setdefault(
+            strategy_reference, object.__getattribute__(binding, "strategy_class")
+        )
+        if previous_class is not object.__getattribute__(binding, "strategy_class"):
+            raise RuntimeAssemblyError("strategy_binding_mismatch")
+        runtime_routes.append(route)
+    try:
+        checked_routes = TrustedRegistryV2(tuple(runtime_routes))
+        if checked_routes.routes != contract_routes:
+            raise RuntimeAssemblyError("route_binding_mismatch")
+    except RuntimeAssemblyError:
+        raise
+    except (AttributeError, RunConfigError, TypeError):
+        raise RuntimeAssemblyError("route_binding_mismatch") from None
+    return contract_registry, bindings
+
+
 def _select_binding(
     plan: ResolvedPlan,
     bindings: tuple[RouteBinding, ...],
 ) -> RouteBinding:
     key = (plan.environment, _references_tuple(plan.references))
     matches = tuple(binding for binding in bindings if _route_key(binding.route) == key)
+    if not matches:
+        raise RuntimeAssemblyError("runtime_binding_missing")
+    if len(matches) != 1:
+        raise RuntimeAssemblyError("runtime_binding_ambiguous")
+    return matches[0]
+
+
+def _select_binding_v2(
+    plan: ResolvedPlanV2,
+    bindings: tuple[RouteBindingV2, ...],
+) -> RouteBindingV2:
+    key = (plan.environment, _references_tuple_v2(plan.references))
+    matches = tuple(
+        binding
+        for binding in bindings
+        if _route_key_v2(binding.route)[:2] == key
+    )
     if not matches:
         raise RuntimeAssemblyError("runtime_binding_missing")
     if len(matches) != 1:
@@ -243,7 +419,7 @@ class RunSession:
         store: BtApiStore,
         broker: BtApiBroker,
         proxy: ServiceReadProxy,
-        config: ValidatedRunConfig,
+        config: ValidatedRunConfig | ValidatedRunConfigV2,
     ) -> None:
         self._cerebro = cerebro
         self._store = store
@@ -441,7 +617,10 @@ class RunSession:
         return False
 
 
-def assemble_run(source: object, registry: RuntimeBindings) -> RunSession:
+def assemble_run(
+    source: object,
+    registry: RuntimeBindings | RuntimeBindingsV2,
+) -> RunSession:
     """Parse and revalidate one complete route before creating provider resources.
 
     The YAML input contains only I52 symbolic selectors. It cannot provide an
@@ -450,12 +629,33 @@ def assemble_run(source: object, registry: RuntimeBindings) -> RunSession:
     """
 
     config = parse_config(source)
-    contract_registry, bindings = _runtime_registry_parts(registry)
-    plan = resolve_plan(config, contract_registry)
-    validate_plan(plan, config, contract_registry)
-    if config.plugins:
-        raise RuntimeAssemblyError("plugins_unsupported")
-    binding = _select_binding(plan, bindings)
+    strategy_parameters = {}
+    if type(config) is ValidatedRunConfig:
+        contract_registry, bindings = _runtime_registry_parts(registry)
+        plan = resolve_plan(config, contract_registry)
+        validate_plan(plan, config, contract_registry)
+        if config.plugins:
+            raise RuntimeAssemblyError("plugins_unsupported")
+        binding = _select_binding(plan, bindings)
+    elif type(config) is ValidatedRunConfigV2:
+        contract_registry, bindings = _runtime_registry_v2_parts(registry)
+        plan = resolve_plan(config, contract_registry)
+        validate_plan(plan, config, contract_registry)
+        if not _REQUIRED_V2_READ_CAPABILITIES.issubset(plan.requested_capabilities):
+            raise RuntimeAssemblyError("required_read_capability_missing")
+        if any(enabled for _name, enabled in config.plugins):
+            raise RuntimeAssemblyError("plugins_unsupported")
+        binding = _select_binding_v2(plan, bindings)
+        # Contract resolution validates names, top-level types, required
+        # parameters, and the bounded nested tree. This API returns fresh
+        # ordinary list/dict values suitable for Backtrader's kwargs adapter.
+        strategy_parameters = config.strategy_parameters_dict()
+        if type(strategy_parameters) is not dict or any(
+            type(name) is not str for name in strategy_parameters
+        ):
+            raise RuntimeAssemblyError("invalid_strategy_parameters")
+    else:  # parse_config currently returns only these two exact DTO types.
+        raise RuntimeAssemblyError("unsupported_config_version")
     if not callable(getattr(ServiceReadProxy, "supports_bar_history", None)):
         raise RuntimeAssemblyError("backtrader_bar_history_capability_unavailable")
 
@@ -499,7 +699,7 @@ def assemble_run(source: object, registry: RuntimeBindings) -> RunSession:
             raise RuntimeAssemblyError("broker_not_read_only")
 
         cerebro = Cerebro(runonce=False, preload=False, live=True, writer=False, stdstats=False)
-        cerebro.addstrategy(binding.strategy_class)
+        cerebro.addstrategy(binding.strategy_class, **strategy_parameters)
         for spec in binding.feeds:
             feed = BtApiFeed(
                 dataname=spec.dataname,
@@ -524,8 +724,10 @@ def assemble_run(source: object, registry: RuntimeBindings) -> RunSession:
 __all__ = [
     "FeedSpec",
     "RouteBinding",
+    "RouteBindingV2",
     "RunSession",
     "RuntimeAssemblyError",
     "RuntimeBindings",
+    "RuntimeBindingsV2",
     "assemble_run",
 ]

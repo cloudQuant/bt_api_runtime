@@ -801,8 +801,8 @@ def parse_config(source: Union[str, bytes]) -> Union[ValidatedRunConfig, Validat
 
     This validates structure and symbolic-reference spelling only. It does not
     resolve references, load plugins or strategies, grant permissions, or run
-    a provider. Schema v2 returns its own DTO; its resolver integration is
-    explicitly deferred and does not produce the version-1 plan tuple.
+    a provider. Schema v2 returns its own DTO; the separate resolver can
+    produce a version-2 plan that does not grant authority.
     """
 
     text = _input_text(source)
