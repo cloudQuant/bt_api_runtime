@@ -14,6 +14,7 @@ from .assembly import (
 from .sdk_readonly import (
     SdkClockBinding,
     SdkEnvironmentMapping,
+    SdkMarketSourceExpectation,
     SdkReadOnlyError,
     SdkReadOnlyFacadeFactory,
     SdkReadOnlyResourceOwner,
@@ -33,6 +34,7 @@ __all__ = [
     "RuntimeCleanupReport",
     "SdkClockBinding",
     "SdkEnvironmentMapping",
+    "SdkMarketSourceExpectation",
     "SdkReadOnlyError",
     "SdkReadOnlyFacadeFactory",
     "SdkReadOnlyResourceOwner",

@@ -27,10 +27,10 @@ references, static capability declaration, and strategy-parameter contract to
 one code-owned strategy class, feed set, and provider factory before invoking
 that factory.
 
-The current source candidate is version 0.1.4. It adds an optional lazy-imported
-SDK read-only facade factory and resource owner; the Python 3.11+ SDK remains
-absent from the runtime's required dependencies so ordinary package imports
-continue to support Python 3.9+.
+The current source candidate is version 0.1.6. It includes an optional
+lazy-imported SDK read-only facade factory and resource owner; the Python 3.11+
+SDK remains absent from the runtime's required dependencies so ordinary
+package imports continue to support Python 3.9+.
 
 The application constructs a code-owned `RuntimeBindings` (v1) or
 `RuntimeBindingsV2` (v2) registry. Each route binds an ordinary
@@ -92,14 +92,25 @@ dimensions. SDK identity and scope checks validate supplied typed objects; they
 do not replace the server's authenticated grants or prove the real provider
 behind a deployment endpoint.
 
-The composition explicitly sets the SDK market client's
-`require_source_descriptor=True`. A successful subscription must therefore
-include a typed `MarketSourceDescriptor` matching the requested SDK key and
-stream metadata. This validates the SDK protocol boundary only: the source,
-provider, clock-domain, session, and clock-source fields are not checked here
-against a trusted deployment authority. Their truth and any clock calibration
-remain **NOT_PROVEN**. The local source-fake test checks the typed descriptor
-path using synthetic values; it is not evidence of an actual provider source.
+The code-owned `SdkReadOnlySpecV2` carries an explicit
+`SdkMarketSourceExpectation`: `source`, `clock_domain_id`,
+`clock_source_session_id`, and `clock_source`. The factory passes those
+independent values to the SDK's `ExpectedMarketSourceIdentity`; missing or
+invalid values fail preflight before a transport or subscriber is created.
+The SDK checks all four fields on the initial subscribe and each recovery
+subscribe, so a mismatch blocks bootstrap or recovery data delivery. This
+runtime binds one market client and uses the SDK's singleton `start()` path.
+The SDK's separate `start_many()` batch path requires the batch bootstrap
+operation when an expected identity is present; it does not fall back to
+singleton starts if that operation is unavailable. This runtime adds no batch
+scheduler.
+
+These checks establish local consistency between code-owned expectations and a
+service-supplied typed descriptor only. They do not prove descriptor truth,
+provider/source authenticity, account authorization, or clock calibration;
+those remain **NOT_PROVEN**. The local source-fake tests exercise the typed
+descriptor and recovery checks with synthetic values, not an actual provider
+source.
 
 The factory builds the real `ServiceClientRuntime`, `ServiceAccountClient`,
 `ServiceMarketClient`, and Backtrader `ServiceReadProxy`. Only the SDK's outer

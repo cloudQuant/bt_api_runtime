@@ -42,7 +42,11 @@ from bt_api_base.service_protocol import (
 )
 from bt_api_py.service_account import ServiceAccountClient
 from bt_api_py.service_config import parse_client_config
-from bt_api_py.service_market import ServiceMarketClient
+from bt_api_py.service_market import (
+    ExpectedMarketSourceIdentity,
+    ServiceMarketClient,
+    ServiceMarketError,
+)
 from bt_api_py.service_registry import (
     PrincipalGrant,
     ResourceGrant,
@@ -64,6 +68,7 @@ from bt_api_runtime import (
     RuntimeBindingsV2,
     SdkClockBinding,
     SdkEnvironmentMapping,
+    SdkMarketSourceExpectation,
     SdkReadOnlyError,
     SdkReadOnlyFacadeFactory,
     SdkReadOnlySpecV2,
@@ -96,8 +101,16 @@ _SERVICE_MARKET_OPERATIONS = frozenset(
 _STREAM_EPOCH = "synthetic-epoch-one"
 _BAR_OPEN = "2026-10-01T12:00:00Z"
 _BAR_CLOSE = "2026-10-01T12:01:00Z"
+_BAR_TWO_CLOSE = "2026-10-01T12:02:00Z"
 _OBSERVED_AT = "2026-10-01T12:02:00Z"
+_SECOND_OBSERVED_AT = "2026-10-01T12:03:00Z"
 _DATA_NAME = "SYNTH-USD"
+_SOURCE_EXPECTATION = {
+    "source": "source-fake-provider-route",
+    "clock_domain_id": "source-fake-clock-domain",
+    "clock_source_session_id": "source-fake-clock-session",
+    "clock_source": "source-fake-clock-source",
+}
 _SAFE_SETUP_EXCEPTION_TYPES = frozenset(
     {
         "AssertionError",
@@ -178,13 +191,26 @@ class _SourceFakeEventSubscriber:
 class _SyntheticReadService:
     """Synthetic service handler used behind the fake request/reply leaf."""
 
-    def __init__(self, account_key, resource, instrument, account_ref) -> None:
+    def __init__(
+        self,
+        account_key,
+        resource,
+        instrument,
+        account_ref,
+        *,
+        source_identity_overrides=(),
+        history_bar_count=1,
+    ) -> None:
         self.account_key = account_key
         self.resource = resource
         self.instrument = instrument
         self.account_ref = account_ref
         self.market_registrations: set[str] = set()
         self.operations: list[str] = []
+        self.source_identity_overrides = tuple(source_identity_overrides)
+        self.subscribe_calls = 0
+        self.history_calls = 0
+        self.history_bar_count = history_bar_count
 
     def account_snapshot(self, context, arguments):
         self.operations.append("account.snapshot")
@@ -267,16 +293,19 @@ class _SyntheticReadService:
                 "already_subscribed": already_subscribed,
             }
             if arguments.get("require_source_descriptor") is True:
+                descriptor_identity = dict(_SOURCE_EXPECTATION)
+                if self.subscribe_calls < len(self.source_identity_overrides):
+                    override = self.source_identity_overrides[self.subscribe_calls]
+                    if override is not None:
+                        descriptor_identity.update(override)
+                self.subscribe_calls += 1
                 reply["source_descriptor"] = MarketSourceDescriptor(
                     key=key,
                     stream_id=stream_id,
                     epoch=_STREAM_EPOCH,
                     provider=key.instrument.provider,
-                    source="source-fake-provider-route",
                     connection_generation=1,
-                    clock_domain_id="source-fake-clock-domain",
-                    clock_source_session_id="source-fake-clock-session",
-                    clock_source="source-fake-clock-source",
+                    **descriptor_identity,
                 ).to_dict()
             return reply
         if operation == "market.unsubscribe":
@@ -288,27 +317,41 @@ class _SyntheticReadService:
                 "upstream_released": not self.market_registrations,
             }
         if operation == "market.history":
+            self.history_calls += 1
             request = MarketHistoryRequest(
                 key=key,
                 start_time_utc=arguments["start_time_utc"],
                 end_time_utc=arguments["end_time_utc"],
                 limit=arguments["limit"],
             )
-            bar = MarketBar(
-                open_time_utc=_BAR_OPEN,
-                close_time_utc=_BAR_CLOSE,
-                open="100",
-                high="101",
-                low="99",
-                close="100.5",
-                volume="2",
+            bars = (
+                MarketBar(
+                    open_time_utc=_BAR_OPEN,
+                    close_time_utc=_BAR_CLOSE,
+                    open="100",
+                    high="101",
+                    low="99",
+                    close="100.5",
+                    volume="2",
+                ),
+                MarketBar(
+                    open_time_utc=_BAR_CLOSE,
+                    close_time_utc=_BAR_TWO_CLOSE,
+                    open="100.5",
+                    high="102",
+                    low="100",
+                    close="101",
+                    volume="3",
+                ),
             )
             return MarketHistoryPage(
                 request=request,
-                bars=(bar,),
+                bars=bars[: self.history_bar_count],
                 complete=True,
                 next_start_time_utc=None,
-                observed_at_utc=_OBSERVED_AT,
+                observed_at_utc=(
+                    _SECOND_OBSERVED_AT if self.history_bar_count > 1 else _OBSERVED_AT
+                ),
             ).to_dict()
         if registration_id not in self.market_registrations:
             raise AssertionError("market read arrived without a synthetic subscription")
@@ -467,6 +510,9 @@ def _make_stack(
     *,
     subscriber_close_failures: int = 0,
     drop_unregister_response: bool = False,
+    source_identity_overrides=(),
+    history_bar_count: int = 1,
+    history_end_utc: str | None = None,
     route: TrustedRouteV2 | None = None,
 ):
     suffix = environment.value
@@ -564,7 +610,14 @@ def _make_stack(
         requirements_version="source-fake-requirements-v1",
         lease_seconds=30,
     )
-    service = _SyntheticReadService(account_key, resource, instrument, account_ref)
+    service = _SyntheticReadService(
+        account_key,
+        resource,
+        instrument,
+        account_ref,
+        source_identity_overrides=source_identity_overrides,
+        history_bar_count=history_bar_count,
+    )
     registry.register_handler(instance_id, "account.snapshot", service.account_snapshot)
     for operation in _SERVICE_MARKET_OPERATIONS:
         registry.register_handler(
@@ -634,10 +687,15 @@ def _make_stack(
     parsed_config = parse_client_config(raw_config)
     subscriber = _SourceFakeEventSubscriber(close_failures=subscriber_close_failures)
     transport_factory_calls = []
+    subscriber_factory_calls = []
 
     def transport_factory(profile, selected_peer):
         transport_factory_calls.append((profile, selected_peer))
         return transport
+
+    def subscriber_factory(binding, scope):
+        subscriber_factory_calls.append((binding, scope))
+        return subscriber
 
     clock = lambda: datetime(2026, 10, 1, 12, 2, tzinfo=timezone.utc)
     references = SdkRouteReferencesV2(
@@ -680,17 +738,18 @@ def _make_stack(
         product_type=instrument.product_type,
         data_source_ref=market_key.source_ref,
         entitlement_ref=market_key.entitlement_ref,
+        market_source_expectation=SdkMarketSourceExpectation(**_SOURCE_EXPECTATION),
         scope_context_field=scope_context_field,
         scope_context_ref=_DOMAIN_REF,
         clock_binding=SdkClockBinding("synthetic-clock/exchange-utc", clock),
         data_name=_DATA_NAME,
         history_start_utc=_BAR_OPEN,
-        history_end_utc=_BAR_CLOSE,
+        history_end_utc=history_end_utc or _BAR_CLOSE,
         valuation_currency="USD",
         position_mode="net",
         qty_unit="base_units",
         transport_factory=transport_factory,
-        subscriber_factory=lambda _binding, _scope: subscriber,
+        subscriber_factory=subscriber_factory,
     )
     factory = SdkReadOnlyFacadeFactory(spec)
     return {
@@ -701,6 +760,7 @@ def _make_stack(
         "registry": registry,
         "transport": transport,
         "transport_factory_calls": transport_factory_calls,
+        "subscriber_factory_calls": subscriber_factory_calls,
         "subscriber": subscriber,
     }
 
@@ -737,6 +797,21 @@ def _runtime_bindings(tmp_path, stacks):
         ),
     )
     return bindings, routes
+
+
+def _single_stack_bindings(stack, strategy):
+    route = stack["spec"].route
+    return RuntimeBindingsV2(
+        TrustedRegistryV2((route,)),
+        (
+            RouteBindingV2(
+                route,
+                strategy,
+                (FeedSpec(_DATA_NAME),),
+                stack["factory"],
+            ),
+        ),
+    )
 
 
 def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(tmp_path):
@@ -908,12 +983,240 @@ def test_factory_requires_sdk_market_source_descriptor(tmp_path):
     try:
         owner.market_client.start()
         descriptor = owner.market_client.source_descriptor
+        expected = owner.market_client._expected_source_identity
+        assert type(expected) is ExpectedMarketSourceIdentity
+        assert {
+            "source": expected.source,
+            "clock_domain_id": expected.clock_domain_id,
+            "clock_source_session_id": expected.clock_source_session_id,
+            "clock_source": expected.clock_source,
+        } == _SOURCE_EXPECTATION
         assert type(descriptor) is MarketSourceDescriptor
         assert descriptor.key == owner.market_client.key
-        assert descriptor.source == "source-fake-provider-route"
-        assert descriptor.clock_domain_id == "source-fake-clock-domain"
+        assert {
+            "source": descriptor.source,
+            "clock_domain_id": descriptor.clock_domain_id,
+            "clock_source_session_id": descriptor.clock_source_session_id,
+            "clock_source": descriptor.clock_source,
+        } == _SOURCE_EXPECTATION
     finally:
         owner.close()
+        stack["registry"].close()
+
+
+@pytest.mark.parametrize(
+    "invalid_expectation",
+    (None, "whitespace", "wrong_type"),
+    ids=("missing", "whitespace", "wrong_type"),
+)
+def test_source_expectation_must_be_explicit_and_valid_before_io(tmp_path, invalid_expectation):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    expectation = stack["spec"].market_source_expectation
+    if invalid_expectation == "whitespace":
+        expectation = replace(expectation, clock_source_session_id=" session ")
+    elif invalid_expectation == "wrong_type":
+        expectation = {"source": "received-descriptor-must-not-be-used"}
+    else:
+        expectation = None
+    factory = SdkReadOnlyFacadeFactory(
+        replace(stack["spec"], market_source_expectation=expectation)
+    )
+
+    with pytest.raises(SdkReadOnlyError) as error:
+        factory.build()
+
+    assert error.value.code == "invalid_sdk_market_source_expectation"
+    assert error.value.__context__ is None
+    assert factory.owner.runtime is None
+    assert stack["transport_factory_calls"] == []
+    assert stack["subscriber_factory_calls"] == []
+    assert stack["transport"].operations == []
+    assert stack["service"].operations == []
+    stack["registry"].close()
+
+
+@pytest.mark.parametrize("field", tuple(_SOURCE_EXPECTATION))
+def test_each_source_identity_mismatch_blocks_first_bar_and_history(tmp_path, field):
+    observations = []
+    stack = _make_stack(
+        Environment.PAPER,
+        tmp_path,
+        source_identity_overrides=({field: f"unexpected-{field}"},),
+    )
+
+    class NoBarStrategy(bt.Strategy):
+        params = (("enabled", False),)
+
+        def next(self):
+            observations.append(float(self.data.close[0]))
+
+    session = assemble_run(
+        _run_config(stack["spec"].route),
+        _single_stack_bindings(stack, NoBarStrategy),
+    )
+    try:
+        with pytest.raises(ServiceMarketError) as run_error:
+            session.run()
+
+        owner = stack["owner"]
+        assert run_error.value.code == "SOURCE_IDENTITY_MISMATCH"
+        assert observations == []
+        assert stack["service"].history_calls == 0
+        assert stack["service"].subscribe_calls == 1
+        assert "market.subscribe" in stack["service"].operations
+        assert "market.history" not in stack["service"].operations
+        assert "market.unsubscribe" in stack["service"].operations
+        assert stack["service"].market_registrations == set()
+        assert stack["subscriber"].closed is True
+
+        owner.close()
+        assert owner.state == "closed"
+        assert owner.runtime.state == "closed"
+        assert owner.runtime.cleanup_failures == 0
+        assert owner.runtime.unregister_uncertainties == 0
+        assert owner.runtime.unknown_registration_count == 0
+        assert stack["transport"].closed is True
+    finally:
+        if stack["owner"].state != "closed":
+            try:
+                stack["owner"].close()
+            except SdkReadOnlyError:
+                pass
+        stack["registry"].close()
+
+
+def test_source_mismatch_cleanup_uncertainty_retains_owner_resources(tmp_path):
+    observations = []
+    stack = _make_stack(
+        Environment.PAPER,
+        tmp_path,
+        source_identity_overrides=({"source": "unexpected-source"},),
+        drop_unregister_response=True,
+    )
+
+    class NoBarStrategy(bt.Strategy):
+        params = (("enabled", False),)
+
+        def next(self):
+            observations.append(float(self.data.close[0]))
+
+    session = assemble_run(
+        _run_config(stack["spec"].route),
+        _single_stack_bindings(stack, NoBarStrategy),
+    )
+    try:
+        with pytest.raises(ServiceMarketError) as run_error:
+            session.run()
+
+        owner = stack["owner"]
+        assert run_error.value.code == "SOURCE_IDENTITY_MISMATCH"
+        assert observations == []
+        assert stack["service"].history_calls == 0
+        assert stack["service"].market_registrations == set()
+        assert stack["subscriber"].closed is True
+
+        with pytest.raises(SdkReadOnlyError) as close_error:
+            owner.close()
+
+        assert close_error.value.code == "sdk_runtime_cleanup_unconfirmed"
+        assert owner.retained is True
+        assert owner.state == "remote_uncertain"
+        assert owner.runtime.state == "closed"
+        assert owner.runtime.unregister_uncertainties > 0
+        assert stack["transport"].closed is True
+    finally:
+        stack["registry"].close()
+
+
+def test_recovery_source_mismatch_cannot_deliver_another_strategy_bar(tmp_path):
+    observations = []
+    recovery = {}
+    stack = _make_stack(
+        Environment.LIVE,
+        tmp_path,
+        source_identity_overrides=(
+            None,
+            {"clock_source_session_id": "unexpected-recovered-session"},
+        ),
+        history_bar_count=2,
+        history_end_utc=_BAR_TWO_CLOSE,
+    )
+
+    class RecoverOnFirstBarStrategy(bt.Strategy):
+        params = (("enabled", False),)
+
+        def next(self):
+            observations.append(float(self.data.close[0]))
+            if len(observations) == 1:
+                try:
+                    market_client.recover()
+                except ServiceMarketError as error:
+                    recovery["code"] = error.code
+                    recovery["descriptor"] = market_client.source_descriptor
+                    try:
+                        market_client.poll()
+                    except ServiceMarketError as poll_error:
+                        recovery["poll_code"] = poll_error.code
+                    raise
+
+    session = assemble_run(
+        _run_config(stack["spec"].route),
+        _single_stack_bindings(stack, RecoverOnFirstBarStrategy),
+    )
+    market_client = stack["owner"].market_client
+    try:
+        with pytest.raises(ServiceMarketError) as run_error:
+            session.run()
+
+        assert run_error.value.code == "SOURCE_IDENTITY_MISMATCH"
+        assert observations == [100.5]
+        assert recovery == {
+            "code": "SOURCE_IDENTITY_MISMATCH",
+            "descriptor": None,
+            "poll_code": "CLIENT_NOT_STARTED",
+        }
+        assert stack["service"].subscribe_calls == 2
+        assert stack["service"].history_calls == 1
+        assert stack["service"].operations.count("market.history") == 1
+        assert stack["owner"].market_client.source_descriptor is None
+        assert stack["service"].market_registrations == set()
+        assert stack["subscriber"].closed is True
+
+        stack["owner"].close()
+        assert stack["owner"].state == "closed"
+        assert stack["owner"].runtime.state == "closed"
+        assert stack["owner"].runtime.cleanup_failures == 0
+        assert stack["owner"].runtime.unregister_uncertainties == 0
+        assert stack["owner"].runtime.unknown_registration_count == 0
+    finally:
+        if stack["owner"].state != "closed":
+            try:
+                stack["owner"].close()
+            except SdkReadOnlyError:
+                pass
+        stack["registry"].close()
+
+
+def test_expected_source_identity_batch_start_does_not_fallback_to_singleton(tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    owner = stack["factory"].build()
+    try:
+        with pytest.raises(ServiceMarketError) as error:
+            ServiceMarketClient.start_many((owner.market_client,))
+
+        assert error.value.code == "EXPECTED_SOURCE_REQUIRES_BATCH_BOOTSTRAP"
+        assert stack["service"].operations == []
+        assert stack["subscriber_factory_calls"] == []
+        assert stack["subscriber"].close_calls == 0
+        owner.close()
+        assert owner.state == "closed"
+        assert owner.runtime.state == "closed"
+    finally:
+        if owner.state != "closed":
+            try:
+                owner.close()
+            except SdkReadOnlyError:
+                pass
         stack["registry"].close()
 
 

@@ -87,6 +87,24 @@ class SdkClockBinding:
 
 
 @dataclass(frozen=True)
+class SdkMarketSourceExpectation:
+    """Code-owned source and clock identity expected from the SDK descriptor.
+
+    These values are independent deployment declarations. They are never
+    copied from a service response and establish local consistency only; they
+    do not prove provider/source truth or clock calibration.
+    """
+
+    source: str
+    clock_domain_id: str
+    clock_source_session_id: str
+    clock_source: str
+
+    def __repr__(self) -> str:
+        return "SdkMarketSourceExpectation(redacted=True)"
+
+
+@dataclass(frozen=True)
 class SdkReadOnlySpecV2:
     """Typed code-owned inputs for one account-plus-market read-only client.
 
@@ -95,7 +113,8 @@ class SdkReadOnlySpecV2:
     separate from that config: the I52 grammar and SDK reference grammar need
     not match. The remaining fields bind those pairs to the exact SDK identity,
     account, endpoint, scopes, instrument, source and clock supplied by the
-    deployment.
+    deployment. ``market_source_expectation`` is an independent code-owned
+    declaration checked against each descriptor returned by the SDK.
 
     ``transport_factory`` and ``subscriber_factory`` replace only the SDK's
     outer I/O leaves. The SDK runtime, account/market facades and
@@ -130,6 +149,7 @@ class SdkReadOnlySpecV2:
     product_type: str
     data_source_ref: str
     entitlement_ref: str
+    market_source_expectation: SdkMarketSourceExpectation
     scope_context_field: str
     scope_context_ref: str
     clock_binding: SdkClockBinding
@@ -182,7 +202,10 @@ def _load_sdk() -> dict[str, Any]:
         from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
         from bt_api_py.service_account import ServiceAccountClient
         from bt_api_py.service_config import ClientConfig
-        from bt_api_py.service_market import ServiceMarketClient
+        from bt_api_py.service_market import (
+            ExpectedMarketSourceIdentity,
+            ServiceMarketClient,
+        )
         from bt_api_py.service_runtime import ServiceClientRuntime
     except Exception:  # noqa: BLE001 - map optional import failures to one finite code
         failed = True
@@ -192,6 +215,7 @@ def _load_sdk() -> dict[str, Any]:
         "AccountKey": AccountKey,
         "AccountResourceKey": AccountResourceKey,
         "ClientConfig": ClientConfig,
+        "ExpectedMarketSourceIdentity": ExpectedMarketSourceIdentity,
         "MarketInstrumentKey": MarketInstrumentKey,
         "MarketSubscriptionKey": MarketSubscriptionKey,
         "ServiceAccountClient": ServiceAccountClient,
@@ -207,6 +231,10 @@ def _load_sdk() -> dict[str, Any]:
 
 def _string(value: object) -> bool:
     return type(value) is str and bool(value) and "\x00" not in value
+
+
+def _market_identity_string(value: object) -> bool:
+    return _string(value) and value == value.strip()
 
 
 def _is_empty_dimension(value: object) -> bool:
@@ -458,6 +486,21 @@ def _validate_spec(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, An
         or not callable(spec.subscriber_factory)
     ):
         raise SdkReadOnlyError("invalid_sdk_read_factory") from None
+    expected_source = spec.market_source_expectation
+    if (
+        type(expected_source) is not SdkMarketSourceExpectation
+        or any(
+            not _market_identity_string(value)
+            for value in (
+                getattr(expected_source, "source", None),
+                getattr(expected_source, "clock_domain_id", None),
+                getattr(expected_source, "clock_source_session_id", None),
+                getattr(expected_source, "clock_source", None),
+            )
+        )
+        or not isinstance(sdk.get("ExpectedMarketSourceIdentity"), type)
+    ):
+        raise SdkReadOnlyError("invalid_sdk_market_source_expectation") from None
     identity = spec.identity
     peer = spec.peer
     account_key = spec.account_key
@@ -772,8 +815,9 @@ class SdkReadOnlyFacadeFactory:
         self._used = True
 
         # All reference, environment, identity, account, endpoint, scope,
-        # product, data-source, clock, capability, and ClientConfig checks run
-        # before constructing the SDK runtime or calling an I/O factory.
+        # product, data-source, source/clock expectation, capability, and
+        # ClientConfig checks run before constructing the SDK runtime or calling
+        # an I/O factory.
         sdk = self._sdk
         profile = self._profile
         if type(profile) is not dict or type(sdk) is not dict:
@@ -801,6 +845,13 @@ class SdkReadOnlyFacadeFactory:
         failure_code = None
         process_control_error = None
         try:
+            expected_source = spec.market_source_expectation
+            expected_source_identity = sdk["ExpectedMarketSourceIdentity"](
+                source=expected_source.source,
+                clock_domain_id=expected_source.clock_domain_id,
+                clock_source_session_id=expected_source.clock_source_session_id,
+                clock_source=expected_source.clock_source,
+            )
             runtime = sdk["ServiceClientRuntime"](
                 spec.client_config,
                 identity=spec.identity,
@@ -832,9 +883,11 @@ class SdkReadOnlyFacadeFactory:
                 subscriber_factory=spec.subscriber_factory,
                 stream_scope=spec.stream_scope,
                 # Require the SDK's typed source descriptor on subscribe.
-                # This checks that the service supplied the protocol object;
-                # this composition has no trusted authority for its truth.
+                # The expected source/clock identity is independently supplied
+                # by code-owned configuration; its match check is still only
+                # local consistency, not proof of provider/source truth.
                 require_source_descriptor=True,
+                expected_source_identity=expected_source_identity,
             )
             owner._market_client = market_client
 
@@ -888,6 +941,7 @@ class SdkReadOnlyFacadeFactory:
 __all__ = [
     "SdkClockBinding",
     "SdkEnvironmentMapping",
+    "SdkMarketSourceExpectation",
     "SdkReadOnlyError",
     "SdkReadOnlyFacadeFactory",
     "SdkReadOnlyResourceOwner",
