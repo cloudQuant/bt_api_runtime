@@ -14,8 +14,10 @@ runtime.
 
 from __future__ import annotations
 
+import inspect
 import threading
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Any, Callable
 
 from bt_api_run_contract import Environment, ReferencesV2, TrustedRouteV2
@@ -196,37 +198,60 @@ def _load_sdk() -> dict[str, Any]:
 
     failed = False
     try:
+        service_market = import_module("bt_api_py.service_market")
         from backtrader.stores.service_read_proxy import ServiceFeedBinding, ServiceReadProxy
         from bt_api_base.account_protocol import AccountKey, AccountResourceKey
         from bt_api_base.market_protocol import MarketInstrumentKey, MarketSubscriptionKey
         from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
         from bt_api_py.service_account import ServiceAccountClient
         from bt_api_py.service_config import ClientConfig
-        from bt_api_py.service_market import (
-            ExpectedMarketSourceIdentity,
-            ServiceMarketClient,
-        )
         from bt_api_py.service_runtime import ServiceClientRuntime
     except Exception:  # noqa: BLE001 - map optional import failures to one finite code
         failed = True
     if failed:
         raise SdkReadOnlyError("sdk_read_dependencies_unavailable") from None
+    service_market_symbols = vars(service_market)
     return {
         "AccountKey": AccountKey,
         "AccountResourceKey": AccountResourceKey,
         "ClientConfig": ClientConfig,
-        "ExpectedMarketSourceIdentity": ExpectedMarketSourceIdentity,
+        "ExpectedMarketSourceIdentity": service_market_symbols.get(
+            "ExpectedMarketSourceIdentity"
+        ),
         "MarketInstrumentKey": MarketInstrumentKey,
         "MarketSubscriptionKey": MarketSubscriptionKey,
         "ServiceAccountClient": ServiceAccountClient,
         "ServiceClientRuntime": ServiceClientRuntime,
         "ServiceFeedBinding": ServiceFeedBinding,
-        "ServiceMarketClient": ServiceMarketClient,
+        "ServiceMarketClient": service_market_symbols.get("ServiceMarketClient"),
         "ServiceReadProxy": ServiceReadProxy,
         "WireIdentity": WireIdentity,
         "WireRole": WireRole,
         "WireScope": WireScope,
     }
+
+
+def _supports_expected_market_source_identity(sdk: dict[str, Any]) -> bool:
+    """Require both public source-identity types and the constructor keyword.
+
+    This is a structural compatibility check only. It does not establish that
+    an SDK implementation enforces the expectation or that a returned source
+    descriptor is authentic.
+    """
+
+    expected_identity = sdk.get("ExpectedMarketSourceIdentity")
+    market_client = sdk.get("ServiceMarketClient")
+    if not isinstance(expected_identity, type) or not isinstance(market_client, type):
+        return False
+    try:
+        parameters = inspect.signature(market_client).parameters
+    except (TypeError, ValueError):
+        return False
+    parameter = parameters.get("expected_source_identity")
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 def _string(value: object) -> bool:
@@ -421,6 +446,8 @@ def _validate_config(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, 
 def _validate_spec(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, Any]:
     if type(spec) is not SdkReadOnlySpecV2:
         raise SdkReadOnlyError("invalid_sdk_read_spec") from None
+    if not _supports_expected_market_source_identity(sdk):
+        raise SdkReadOnlyError("sdk_market_source_identity_unsupported") from None
     if type(spec.route) is not TrustedRouteV2 or type(spec.references) is not SdkRouteReferencesV2:
         raise SdkReadOnlyError("invalid_sdk_route_mapping") from None
     if type(spec.environment) is not SdkEnvironmentMapping:
@@ -498,7 +525,6 @@ def _validate_spec(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, An
                 getattr(expected_source, "clock_source", None),
             )
         )
-        or not isinstance(sdk.get("ExpectedMarketSourceIdentity"), type)
     ):
         raise SdkReadOnlyError("invalid_sdk_market_source_expectation") from None
     identity = spec.identity

@@ -27,7 +27,7 @@ references, static capability declaration, and strategy-parameter contract to
 one code-owned strategy class, feed set, and provider factory before invoking
 that factory.
 
-The current source candidate is version 0.1.6. It includes an optional
+The current source candidate is version 0.1.7. It includes an optional
 lazy-imported SDK read-only facade factory and resource owner; the Python 3.11+
 SDK remains absent from the runtime's required dependencies so ordinary
 package imports continue to support Python 3.9+.
@@ -105,6 +105,15 @@ operation when an expected identity is present; it does not fall back to
 singleton starts if that operation is unavailable. This runtime adds no batch
 scheduler.
 
+Lazy preflight checks that the SDK exports both `ExpectedMarketSourceIdentity`
+and `ServiceMarketClient`, and that the market-client constructor explicitly
+accepts `expected_source_identity`. Missing SDK modules or import failures
+produce the finite `sdk_read_dependencies_unavailable` code; an importable SDK
+without this API produces `sdk_market_source_identity_unsupported`. The
+constructor check is structural compatibility evidence only: it does not
+prove that an SDK implementation enforces the expectation, that a descriptor
+is authentic, or that a provider or plugin has the claimed identity.
+
 These checks establish local consistency between code-owned expectations and a
 service-supplied typed descriptor only. They do not prove descriptor truth,
 provider/source authenticity, account authorization, or clock calibration;
@@ -116,8 +125,11 @@ The factory builds the real `ServiceClientRuntime`, `ServiceAccountClient`,
 `ServiceMarketClient`, and Backtrader `ServiceReadProxy`. Only the SDK's outer
 request/reply transport and event subscriber leaves are injectable, so source
 tests can use deterministic fakes without replacing the runtime or facades.
-SDK imports happen only when the factory is built; importing ordinary runtime
-assembly does not require the Python 3.11 SDK on Python 3.9/3.10 installations.
+SDK imports remain lazy: importing `bt_api_runtime` and using ordinary runtime
+assembly do not load `bt_api_py`. The SDK-backed factory loads SDK modules in
+`preflight()`; a direct `build()` performs that preflight first when needed.
+This keeps the Python 3.11+ SDK optional for ordinary Python 3.9+ runtime
+imports and v1 assembly.
 
 `RunSession` drives the per-run proxy close and borrows the factory-owned SDK
 runtime. The application keeps `factory.owner`, lets the session finish its

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import builtins
+import sys
 import threading
 import time
 import traceback
 from dataclasses import fields, replace
 from datetime import datetime, timezone
+from types import ModuleType
 
 import backtrader as bt
 import pytest
@@ -979,6 +981,7 @@ def test_failed_proxy_close_is_retained_until_owner_retry(tmp_path):
 
 def test_factory_requires_sdk_market_source_descriptor(tmp_path):
     stack = _make_stack(Environment.PAPER, tmp_path)
+    assert stack["factory"].preflight(stack["spec"].route) is True
     owner = stack["factory"].build()
     try:
         owner.market_client.start()
@@ -1440,6 +1443,89 @@ def test_sdk_import_boundary_suppresses_ambient_exception(monkeypatch, tmp_path)
     )
     assert stack["factory"].owner.runtime is None
     assert stack["transport_factory_calls"] == []
+    stack["registry"].close()
+
+
+@pytest.mark.parametrize(
+    "legacy_shape",
+    ("missing_identity_type", "missing_constructor_keyword"),
+    ids=("missing-identity-type", "missing-constructor-keyword"),
+)
+def test_legacy_sdk_source_identity_api_fails_before_io_and_redacts(
+    monkeypatch,
+    tmp_path,
+    legacy_shape,
+):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    synthetic_market_module = ModuleType("bt_api_py.service_market")
+
+    if legacy_shape == "missing_identity_type":
+        synthetic_market_module.ServiceMarketClient = ServiceMarketClient
+    else:
+        synthetic_market_module.ExpectedMarketSourceIdentity = ExpectedMarketSourceIdentity
+
+        class LegacyServiceMarketClient:
+            def __init__(self, runtime, mount, key, *, subscriber_factory=None, stream_scope):
+                pass
+
+        synthetic_market_module.ServiceMarketClient = LegacyServiceMarketClient
+
+    monkeypatch.setitem(sys.modules, "bt_api_py.service_market", synthetic_market_module)
+    try:
+        raise RuntimeError("ambient-private-token")
+    except RuntimeError:
+        with pytest.raises(SdkReadOnlyError) as error:
+            stack["factory"].preflight(stack["spec"].route)
+
+    assert error.value.code == "sdk_market_source_identity_unsupported"
+    assert str(error.value) == "sdk_market_source_identity_unsupported"
+    _assert_ambient_exception_is_suppressed(error.value, "ambient-private-token")
+
+    route = stack["spec"].route
+    bindings = RuntimeBindingsV2(
+        TrustedRegistryV2((route,)),
+        (
+            RouteBindingV2(
+                route,
+                _SameStrategy,
+                (FeedSpec(_DATA_NAME),),
+                stack["factory"],
+            ),
+        ),
+    )
+    with pytest.raises(RuntimeAssemblyError) as assembly_error:
+        assemble_run(_run_config(route), bindings)
+
+    assert assembly_error.value.code == "provider_binding_preflight_failed"
+    assert stack["factory"].owner.runtime is None
+    assert stack["transport_factory_calls"] == []
+    assert stack["subscriber_factory_calls"] == []
+    assert stack["transport"].operations == []
+    assert stack["subscriber"].close_calls == 0
+    stack["registry"].close()
+
+
+def test_kwargs_only_legacy_market_client_fails_before_factory_or_io(monkeypatch, tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    synthetic_market_module = ModuleType("bt_api_py.service_market")
+    synthetic_market_module.ExpectedMarketSourceIdentity = ExpectedMarketSourceIdentity
+
+    class KwargsOnlyLegacyServiceMarketClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    synthetic_market_module.ServiceMarketClient = KwargsOnlyLegacyServiceMarketClient
+    monkeypatch.setitem(sys.modules, "bt_api_py.service_market", synthetic_market_module)
+
+    with pytest.raises(SdkReadOnlyError) as error:
+        stack["factory"].preflight(stack["spec"].route)
+
+    assert error.value.code == "sdk_market_source_identity_unsupported"
+    assert stack["factory"].owner.runtime is None
+    assert stack["transport_factory_calls"] == []
+    assert stack["subscriber_factory_calls"] == []
+    assert stack["transport"].operations == []
+    assert stack["subscriber"].close_calls == 0
     stack["registry"].close()
 
 
