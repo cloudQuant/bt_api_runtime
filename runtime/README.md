@@ -27,7 +27,7 @@ references, static capability declaration, and strategy-parameter contract to
 one code-owned strategy class, feed set, and provider factory before invoking
 that factory.
 
-The current source candidate is version 0.1.11 and pins the contract package
+The current source candidate is version 0.1.12 and pins the contract package
 at `bt-api-run-contract==0.1.5`. It includes an optional
 lazy-imported SDK read-only facade factory and resource owner; the Python 3.11+
 SDK remains absent from the runtime's required dependencies so ordinary
@@ -87,14 +87,54 @@ I52-reference-to-SDK-reference pairs, an explicit paper/live environment map,
 typed SDK identity/account/instrument/scope objects, endpoint bindings, and
 code-owned clock, transport, and subscriber factories. The mapping is checked
 against the selected route and the complete public `ClientConfig` projection
-before the provider factory runs. It requires exactly the read-only
-`store.account` and `store.market` mounts, matching service/instance/scope and
-account refs, a single matching communication profile, and no extra mounts.
+before any transport or subscriber factory runs. It requires exactly the
+read-only `store.account` and `store.market` mounts, exact per-mount
+service/instance/scope/transport bindings, and no extra mount or unreferenced
+communication profile. The route strategy ref is explicitly mapped to SDK
+`WireIdentity.actor_ref`; service peers and credential security profiles are
+independent code-owned expectations checked against each mount's configuration.
+Configuration values never create trusted peers or authorize access.
+
+`SdkReadOnlyTargetsV2` binds its `endpoint_ref` and `credential_ref` to the
+route's logical endpoint and credential references. Its immutable `account`
+and `market` targets each declare the service, instance, transport reference,
+security-profile reference, typed peer, and endpoints for that physical host.
+Preflight checks each binding and each referenced profile against those
+code-owned targets, including the exact RPC and market endpoints. It rejects a
+peer conflict when two bindings name the same service with different service
+identities. The route endpoint remains the logical deployment bundle; it does
+not become the account host's physical address. The provider reference on the
+account and market domain objects must still match, so this path does not join
+different providers.
+
+For compatibility, a V2 spec without `targets` is normalized to a pair of
+identical targets from its historical single-host fields and continues to use
+one communication profile. The factory still creates one
+`ServiceClientRuntime`, one account facade, one market facade, and one
+`ServiceReadProxy`; both registrations use the same bound `run_id` and owner
+thread. After startup it checks each immutable SDK binding's service,
+instance, scope, transport, run identity, and exact operation set. Partial
+startup or uncertain unregister/close results keep the resource owner visible
+for owner-thread reconciliation. A retry may clear a transient local transport
+close failure, but it does not prove an uncertain remote unregister was repaired
+or that the remote lease expired.
+
+SDK settings and communication-profile `options` are accepted only through
+the existing SDK `parse_client_config` parser, which enforces supported field
+sets, types, and bounds. The runtime does not certify each option value
+against the target bundle, so options are not trusted target identity and
+cannot grant authority. Peer identity, endpoint values, and each
+security-profile reference are separately code-owned and checked against the
+parsed configuration before any transport or subscriber factory runs.
+Matching a profile reference does not prove that its credential is valid or
+authorized by a provider.
+
 The route strategy ref is explicitly mapped to SDK `WireIdentity.actor_ref`;
-the two code-owned principal refs are also checked, and delegation refs are
-rejected. Provider, account, endpoint/transport, credential-profile, scope,
-product, data source, and clock mappings each have separate fields. Symbol
-equality alone never establishes provider identity or permission.
+the code-owned service principal identity is checked and delegation refs are
+rejected. Provider, account, endpoint bundle, per-host transport/security
+profile, scope, product, data source, and clock mappings each have separate
+fields. Symbol equality alone never establishes provider identity or
+permission.
 
 The SDK clock ref is paired immutably with a code-owned callable through
 `SdkClockBinding`. This records the selected mapping only; it does not prove
@@ -112,7 +152,8 @@ independent values to the SDK's `ExpectedMarketSourceIdentity`; missing or
 invalid values fail preflight before a transport or subscriber is created.
 The SDK checks all four fields on the initial subscribe and each recovery
 subscribe, so a mismatch blocks bootstrap or recovery data delivery. This
-runtime binds one market client and uses the SDK's singleton `start()` path.
+runtime binds one market client to the market target and uses the SDK's
+singleton `start()` path.
 The SDK's separate `start_many()` batch path requires the batch bootstrap
 operation when an expected identity is present; it does not fall back to
 singleton starts if that operation is unavailable. This runtime adds no batch
@@ -155,7 +196,7 @@ runtime. The application keeps `factory.owner`, lets the session finish its
 proxy close, then calls `factory.owner.close()` on the same owner thread. The
 resource owner closes the proxy/facades first, then closes the SDK runtime only
 after the facade call returns. On any failure it keeps the entire visible
-resource group for an owner-thread retry. It checks SDK `state`,
+resource group for owner-thread reconciliation. It checks SDK `state`,
 `cleanup_failures`, `unregister_uncertainties`, and `unknown_registration_count`;
 `is_connected == False` or runtime `state == "closed"` alone is never treated
 as complete cleanup. An uncertain remote registration remains unconfirmed, and
@@ -172,6 +213,12 @@ behavior. Preflight binds local composition inputs only. A matching string or
 UUID does not establish uniqueness, endpoint identity, authorization, source
 truth, or account acceptance; a trusted registry or deployment authority is
 still needed for provider/account identity and permission decisions.
+
+Version `0.1.12` adds the explicit dual-host target bundle while retaining the
+`0.1.11` single-host `SdkReadOnlySpecV2` constructor behavior. The dual-host
+source/fake coverage uses the real SDK runtime and facades with synthetic
+registries and transport/subscriber leaves; it is not real-account or provider
+acceptance.
 
 The session is bound to the thread that assembled it. `run()` and `close()`
 must use that owner thread because the proxy is thread-bound. Any thread may

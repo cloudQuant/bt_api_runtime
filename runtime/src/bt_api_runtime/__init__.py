@@ -19,6 +19,8 @@ from .sdk_readonly import (
     SdkReadOnlyFacadeFactory,
     SdkReadOnlyResourceOwner,
     SdkReadOnlySpecV2,
+    SdkReadOnlyTargetsV2,
+    SdkReadOnlyTargetV2,
     SdkRouteReference,
     SdkRouteReferencesV2,
 )
@@ -39,6 +41,8 @@ __all__ = [
     "SdkReadOnlyFacadeFactory",
     "SdkReadOnlyResourceOwner",
     "SdkReadOnlySpecV2",
+    "SdkReadOnlyTargetV2",
+    "SdkReadOnlyTargetsV2",
     "SdkRouteReference",
     "SdkRouteReferencesV2",
     "assemble_run",

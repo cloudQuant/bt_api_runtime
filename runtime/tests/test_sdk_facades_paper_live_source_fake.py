@@ -74,6 +74,8 @@ from bt_api_runtime import (
     SdkReadOnlyError,
     SdkReadOnlyFacadeFactory,
     SdkReadOnlySpecV2,
+    SdkReadOnlyTargetsV2,
+    SdkReadOnlyTargetV2,
     SdkRouteReference,
     SdkRouteReferencesV2,
     assemble_run,
@@ -402,6 +404,9 @@ class _LocalRequestReplyTransport:
         *,
         drop_unregister_response: bool = False,
         drop_register_response: bool = False,
+        fail_operations: tuple[str, ...] = (),
+        always_drop_unregister_response: bool = False,
+        close_failures_remaining: int = 0,
     ):
         self.registry = registry
         self.principal_ref = principal_ref
@@ -410,6 +415,9 @@ class _LocalRequestReplyTransport:
         self.closed = False
         self.drop_unregister_response = drop_unregister_response
         self.drop_register_response = drop_register_response
+        self.fail_operations = frozenset(fail_operations)
+        self.always_drop_unregister_response = always_drop_unregister_response
+        self.close_failures_remaining = close_failures_remaining
 
     def request(self, request: WireEnvelope, *, timeout: float) -> WireEnvelope:
         if self.closed:
@@ -417,13 +425,14 @@ class _LocalRequestReplyTransport:
         if not 0 < timeout <= 1.0:
             raise AssertionError("RPC timeout was not explicitly bounded")
         self.operations.append(request.header.operation)
+        if request.header.operation in self.fail_operations:
+            raise OSError("synthetic request failure")
         result = self.registry.handle(self.principal_ref, request)
         if request.header.operation == "service.register" and self.drop_register_response:
             self.drop_register_response = False
             raise OSError("synthetic register response loss")
-        if (
-            request.header.operation == "service.unregister"
-            and self.drop_unregister_response
+        if request.header.operation == "service.unregister" and (
+            self.drop_unregister_response or self.always_drop_unregister_response
         ):
             self.drop_unregister_response = False
             raise OSError("synthetic unregister response loss")
@@ -439,6 +448,9 @@ class _LocalRequestReplyTransport:
         )
 
     def close(self) -> None:
+        if self.close_failures_remaining:
+            self.close_failures_remaining -= 1
+            raise OSError("synthetic transient transport close failure")
         self.closed = True
 
 
@@ -774,6 +786,205 @@ def _make_stack(
     }
 
 
+def _make_dual_host_stack(
+    environment: Environment,
+    tmp_path,
+    *,
+    fail_market_discovery: bool = False,
+    always_drop_account_unregister_response: bool = False,
+):
+    """Use the real SDK runtime with independent synthetic account/market hosts."""
+
+    stack = _make_stack(environment, tmp_path)
+    spec = stack["spec"]
+    service = stack["service"]
+    account_registry = stack["registry"]
+    account_transport = stack["transport"]
+    account_transport.always_drop_unregister_response = always_drop_account_unregister_response
+
+    suffix = environment.value
+    market_service_id = f"synthetic-market-service-{suffix}"
+    market_instance_id = f"synthetic-market-gateway-{suffix}"
+    market_scope_ref = spec.market_scope_ref
+    market_peer = WireIdentity(
+        WireRole.SERVICE,
+        f"synthetic-market-principal-{suffix}",
+        market_service_id,
+    )
+    market_registry = ServiceRegistry(
+        tmp_path / f"source-fake-market-{suffix}.sqlite3",
+        service_id=market_service_id,
+        capabilities=(
+            ServiceCapability(
+                market_instance_id,
+                "service.market_source",
+                _SERVICE_MARKET_OPERATIONS,
+            ),
+        ),
+        grants={
+            spec.identity.principal_ref: (
+                PrincipalGrant(
+                    spec.identity,
+                    (
+                        ResourceGrant(
+                            market_instance_id,
+                            "service.market_source",
+                            market_scope_ref,
+                            spec.market_scope,
+                            _SERVICE_MARKET_OPERATIONS,
+                        ),
+                    ),
+                ),
+            )
+        },
+        policy_version="source-fake-market-policy-v1",
+        requirements_version="source-fake-market-requirements-v1",
+        lease_seconds=30,
+    )
+    for operation in _SERVICE_MARKET_OPERATIONS:
+        market_registry.register_handler(
+            market_instance_id,
+            operation,
+            lambda context, arguments, selected=operation: service.market(
+                context, arguments, selected
+            ),
+        )
+    market_registry.set_ready(True)
+
+    market_transport = _LocalRequestReplyTransport(
+        market_registry,
+        spec.identity.principal_ref,
+        market_peer,
+        fail_operations=("service.discover",) if fail_market_discovery else (),
+    )
+    account_transport_ref = spec.transport_ref
+    market_transport_ref = f"synthetic-market-transport-{suffix}"
+    account_security_ref = f"synthetic-account-security-{suffix}"
+    market_security_ref = f"synthetic-market-security-{suffix}"
+    endpoint_bundle_ref = f"synthetic-readonly-host-bundle-{suffix}"
+    credential_bundle_ref = f"synthetic-readonly-credential-bundle-{suffix}"
+    market_rpc_endpoint = "tcp://127.0.0.1:12"
+    market_endpoint = "tcp://127.0.0.1:13"
+    profile_options = {
+        "request_timeout_ms": 1_000,
+        "high_water_mark": 16,
+        "max_message_bytes": 262_144,
+    }
+    raw_config = {
+        "client_config_schema_version": 1,
+        "process_role": "strategy_client",
+        "registration": {"strategy_ref": spec.references.strategy.sdk_ref},
+        "clients": {
+            "gateway": {
+                "config_schema_version": 1,
+                "settings": {
+                    "bindings": [
+                        {
+                            "mount": "store.account",
+                            "service_id": spec.service_id,
+                            "instance_id": spec.instance_id,
+                            "scope_ref": spec.account_scope_ref,
+                            "account_ref": spec.account_ref,
+                            "transport_ref": account_transport_ref,
+                        },
+                        {
+                            "mount": "store.market",
+                            "service_id": market_service_id,
+                            "instance_id": market_instance_id,
+                            "scope_ref": market_scope_ref,
+                            "transport_ref": market_transport_ref,
+                        },
+                    ],
+                    "options": {"request_timeout_ms": 1_000},
+                },
+            }
+        },
+        "communication": {
+            "config_schema_version": 1,
+            "profiles": {
+                account_transport_ref: {
+                    "backend": "zmq",
+                    "config_schema_version": 1,
+                    "endpoints": {"rpc_connect": spec.rpc_endpoint},
+                    "security_profile_ref": account_security_ref,
+                    "options": dict(profile_options),
+                },
+                market_transport_ref: {
+                    "backend": "zmq",
+                    "config_schema_version": 1,
+                    "endpoints": {
+                        "rpc_connect": market_rpc_endpoint,
+                        "market_connect": market_endpoint,
+                    },
+                    "security_profile_ref": market_security_ref,
+                    "options": dict(profile_options),
+                },
+            },
+        },
+    }
+    client_config = parse_client_config(raw_config)
+    public_config = client_config.to_public_dict()
+    expected_profiles = public_config["communication"]["profiles"]
+    transport_factory_calls = []
+
+    def transport_factory(profile, selected_peer):
+        transport_factory_calls.append((dict(profile), selected_peer))
+        if selected_peer == spec.peer and profile == expected_profiles[account_transport_ref]:
+            return account_transport
+        if selected_peer == market_peer and profile == expected_profiles[market_transport_ref]:
+            return market_transport
+        raise AssertionError("unexpected synthetic target or profile")
+
+    references = replace(
+        spec.references,
+        endpoint=SdkRouteReference(spec.route.references.endpoint, endpoint_bundle_ref),
+        credential=SdkRouteReference(spec.route.references.credential, credential_bundle_ref),
+    )
+    targets = SdkReadOnlyTargetsV2(
+        endpoint_ref=endpoint_bundle_ref,
+        credential_ref=credential_bundle_ref,
+        account=SdkReadOnlyTargetV2(
+            service_id=spec.service_id,
+            instance_id=spec.instance_id,
+            transport_ref=account_transport_ref,
+            security_profile_ref=account_security_ref,
+            peer=spec.peer,
+            rpc_endpoint=spec.rpc_endpoint,
+            market_endpoint=None,
+        ),
+        market=SdkReadOnlyTargetV2(
+            service_id=market_service_id,
+            instance_id=market_instance_id,
+            transport_ref=market_transport_ref,
+            security_profile_ref=market_security_ref,
+            peer=market_peer,
+            rpc_endpoint=market_rpc_endpoint,
+            market_endpoint=market_endpoint,
+        ),
+    )
+    dual_spec = replace(
+        spec,
+        references=references,
+        client_config=client_config,
+        security_profile_ref=account_security_ref,
+        market_endpoint=market_endpoint,
+        transport_factory=transport_factory,
+        targets=targets,
+    )
+    factory = SdkReadOnlyFacadeFactory(dual_spec)
+    stack.update(
+        factory=factory,
+        owner=factory.owner,
+        spec=dual_spec,
+        market_registry=market_registry,
+        market_transport=market_transport,
+        registries=(account_registry, market_registry),
+        transports=(account_transport, market_transport),
+        transport_factory_calls=transport_factory_calls,
+    )
+    return stack
+
+
 _SETUP_DIAGNOSTICS: dict[Environment, tuple[str, str, str, str]] = {}
 
 
@@ -821,6 +1032,334 @@ def _single_stack_bindings(stack, strategy):
             ),
         ),
     )
+
+
+def test_factory_registers_account_and_market_on_independent_hosts(tmp_path):
+    stack = _make_dual_host_stack(Environment.PAPER, tmp_path)
+    run_id = "dual-host-sourcefake-run"
+    owner = stack["owner"]
+    spec = stack["spec"]
+    targets = spec.targets
+
+    try:
+        assert stack["factory"].preflight(spec.route, run_id=run_id) is True
+        assert stack["transport_factory_calls"] == []
+        assert stack["subscriber_factory_calls"] == []
+
+        built_owner = stack["factory"].build()
+        assert built_owner is owner
+        assert owner.state == "ready"
+        assert owner.runtime.state == "registered"
+        assert owner.runtime.run_id == run_id
+        assert owner.account_client._runtime is owner.runtime
+        assert owner.market_client._runtime is owner.runtime
+        assert len(stack["transport_factory_calls"]) == 2
+
+        bindings = {binding.mount: binding for binding in owner.runtime.bindings}
+        assert set(bindings) == {"store.account", "store.market"}
+        expected = {
+            "store.account": (
+                targets.account,
+                spec.account_scope_ref,
+                frozenset({"account.snapshot"}),
+            ),
+            "store.market": (
+                targets.market,
+                spec.market_scope_ref,
+                frozenset(
+                    {
+                        "market.subscribe",
+                        "market.unsubscribe",
+                        "market.snapshot",
+                        "market.head",
+                        "market.read_after",
+                        "market.history",
+                    }
+                ),
+            ),
+        }
+        for mount, (target, scope_ref, operations) in expected.items():
+            binding = bindings[mount]
+            assert binding.service_id == target.service_id
+            assert binding.instance_id == target.instance_id
+            assert binding.scope_ref == scope_ref
+            assert binding.transport_ref == target.transport_ref
+            assert binding.scope.run_id == run_id
+            assert binding.scope.strategy_ref == spec.identity.actor_ref
+            assert binding.operations == operations
+
+        owner.account_client.refresh()
+        assert stack["service"].operations.count("account.snapshot") == 1
+        owner.market_client.start()
+        assert "market.subscribe" in stack["service"].operations
+        assert owner.market_client.source_descriptor is not None
+        owner.close()
+        assert owner.state == "closed"
+        assert owner.runtime.state == "closed"
+        assert all(transport.closed for transport in stack["transports"])
+    finally:
+        if owner.state not in {"closed", "remote_uncertain", "close_failed"}:
+            try:
+                owner.close()
+            except SdkReadOnlyError:
+                pass
+        for registry in stack["registries"]:
+            registry.close()
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "expected_code"),
+    (
+        ("cross_binding", "client_config_endpoint_mismatch"),
+        ("profile_security", "client_config_endpoint_mismatch"),
+        ("profile_extra_market_endpoint", "client_config_endpoint_mismatch"),
+        ("extra_profile", "client_config_endpoint_mismatch"),
+        ("route_bundle", "sdk_route_bundle_mismatch"),
+        ("credential_bundle", "sdk_route_bundle_mismatch"),
+    ),
+)
+def test_dual_host_cross_binding_and_profiles_fail_before_io(tmp_path, mismatch, expected_code):
+    stack = _make_dual_host_stack(Environment.PAPER, tmp_path)
+    spec = stack["spec"]
+    bad_spec = spec
+    if mismatch not in {"route_bundle", "credential_bundle"}:
+        public = spec.client_config.to_public_dict()
+        bindings = public["clients"]["gateway"]["settings"]["bindings"]
+        profiles = public["communication"]["profiles"]
+        if mismatch == "cross_binding":
+            bindings[0]["transport_ref"] = spec.targets.market.transport_ref
+        elif mismatch == "profile_security":
+            profiles[spec.targets.market.transport_ref][
+                "security_profile_ref"
+            ] = spec.targets.account.security_profile_ref
+        elif mismatch == "profile_extra_market_endpoint":
+            profiles[spec.targets.account.transport_ref]["endpoints"][
+                "market_connect"
+            ] = spec.targets.market.market_endpoint
+        else:
+            extra_profile = dict(profiles[spec.targets.market.transport_ref])
+            extra_profile["endpoints"] = dict(extra_profile["endpoints"])
+            extra_profile["options"] = dict(extra_profile["options"])
+            profiles["synthetic-extra-profile"] = extra_profile
+        bad_spec = replace(spec, client_config=parse_client_config(public))
+    elif mismatch == "route_bundle":
+        bad_spec = replace(
+            spec,
+            targets=replace(spec.targets, endpoint_ref="different-host-bundle"),
+        )
+    else:
+        bad_spec = replace(
+            spec,
+            targets=replace(spec.targets, credential_ref="different-credential-bundle"),
+        )
+    factory = SdkReadOnlyFacadeFactory(bad_spec)
+
+    try:
+        with pytest.raises(SdkReadOnlyError) as error:
+            factory.preflight(spec.route, run_id="dual-host-invalid-sourcefake")
+        assert error.value.code == expected_code
+        assert stack["transport_factory_calls"] == []
+        assert stack["subscriber_factory_calls"] == []
+    finally:
+        for registry in stack["registries"]:
+            registry.close()
+
+
+@pytest.mark.parametrize(
+    "target_change",
+    (
+        "account_endpoint_on_independent_profile",
+        "shared_profile_endpoint_mismatch",
+        "shared_profile_security_mismatch",
+    ),
+)
+def test_dual_host_rejects_unused_or_inconsistent_account_market_endpoint(
+    tmp_path, target_change
+):
+    stack = _make_dual_host_stack(Environment.PAPER, tmp_path)
+    spec = stack["spec"]
+    account = spec.targets.account
+    market = spec.targets.market
+    if target_change == "account_endpoint_on_independent_profile":
+        account = replace(account, market_endpoint="tcp://127.0.0.1:14")
+    elif target_change == "shared_profile_endpoint_mismatch":
+        account = replace(
+            account,
+            transport_ref=market.transport_ref,
+            security_profile_ref=market.security_profile_ref,
+            rpc_endpoint=market.rpc_endpoint,
+            market_endpoint="tcp://127.0.0.1:14",
+        )
+    else:
+        account = replace(
+            account,
+            transport_ref=market.transport_ref,
+            market_endpoint=market.market_endpoint,
+        )
+    factory = SdkReadOnlyFacadeFactory(
+        replace(spec, targets=replace(spec.targets, account=account))
+    )
+
+    try:
+        with pytest.raises(SdkReadOnlyError) as error:
+            factory.preflight(spec.route, run_id="dual-host-account-endpoint-invalid")
+        assert error.value.code == "sdk_target_identity_or_endpoint_mismatch"
+        assert stack["transport_factory_calls"] == []
+        assert stack["subscriber_factory_calls"] == []
+    finally:
+        for registry in stack["registries"]:
+            registry.close()
+
+
+def test_dual_host_rejects_conflicting_peer_for_same_service_before_io(tmp_path):
+    stack = _make_dual_host_stack(Environment.PAPER, tmp_path)
+    spec = stack["spec"]
+    conflict_peer = WireIdentity(
+        WireRole.SERVICE,
+        "different-principal-for-same-service",
+        spec.targets.account.service_id,
+    )
+    conflicting_market = replace(
+        spec.targets.market,
+        service_id=spec.targets.account.service_id,
+        peer=conflict_peer,
+    )
+    targets = replace(spec.targets, market=conflicting_market)
+    factory = SdkReadOnlyFacadeFactory(replace(spec, targets=targets))
+
+    try:
+        with pytest.raises(SdkReadOnlyError) as error:
+            factory.preflight(spec.route, run_id="dual-host-peer-conflict")
+        assert error.value.code == "sdk_target_peer_conflict"
+        assert stack["transport_factory_calls"] == []
+        assert stack["subscriber_factory_calls"] == []
+    finally:
+        for registry in stack["registries"]:
+            registry.close()
+
+
+def test_dual_host_rejects_peer_actor_mismatch_before_io(tmp_path):
+    stack = _make_dual_host_stack(Environment.PAPER, tmp_path)
+    spec = stack["spec"]
+    wrong_peer = WireIdentity(
+        WireRole.SERVICE,
+        spec.targets.market.peer.principal_ref,
+        "unrelated-service-id",
+    )
+    targets = replace(
+        spec.targets,
+        market=replace(spec.targets.market, peer=wrong_peer),
+    )
+    factory = SdkReadOnlyFacadeFactory(replace(spec, targets=targets))
+
+    try:
+        with pytest.raises(SdkReadOnlyError) as error:
+            factory.preflight(spec.route, run_id="dual-host-peer-actor-mismatch")
+        assert error.value.code == "sdk_target_identity_or_endpoint_mismatch"
+        assert stack["transport_factory_calls"] == []
+        assert stack["subscriber_factory_calls"] == []
+    finally:
+        for registry in stack["registries"]:
+            registry.close()
+
+
+def test_second_host_startup_failure_retains_unknown_first_unregister(tmp_path):
+    stack = _make_dual_host_stack(
+        Environment.PAPER,
+        tmp_path,
+        fail_market_discovery=True,
+        always_drop_account_unregister_response=True,
+    )
+    owner = stack["owner"]
+    try:
+        assert (
+            stack["factory"].preflight(stack["spec"].route, run_id="dual-host-partial-startup")
+            is True
+        )
+        with pytest.raises(SdkReadOnlyError) as error:
+            stack["factory"].build()
+
+        assert error.value.code == "sdk_facade_construction_failed"
+        assert owner.runtime is not None
+        assert owner.retained is True
+        assert owner.state == "remote_uncertain"
+        assert owner.runtime.unregister_uncertainties > 0
+        assert owner.runtime.unknown_registration_count == 0
+        assert stack["transport"].operations.count("service.register") == 1
+        assert stack["market_transport"].operations.count("service.discover") == 1
+        assert stack["market_transport"].operations.count("service.register") == 0
+    finally:
+        for registry in stack["registries"]:
+            registry.close()
+
+
+def test_dual_host_close_retains_owner_when_unregister_is_unobserved(tmp_path):
+    stack = _make_dual_host_stack(
+        Environment.PAPER,
+        tmp_path,
+        always_drop_account_unregister_response=True,
+    )
+    owner = stack["owner"]
+    try:
+        assert (
+            stack["factory"].preflight(stack["spec"].route, run_id="dual-host-close-uncertain")
+            is True
+        )
+        assert stack["factory"].build() is owner
+        with pytest.raises(SdkReadOnlyError) as error:
+            owner.close()
+
+        assert error.value.code == "sdk_runtime_cleanup_unconfirmed"
+        assert owner.retained is True
+        assert owner.state == "remote_uncertain"
+        assert owner.runtime.unregister_uncertainties > 0
+        assert owner.runtime.state == "closed"
+        assert stack["transport"].operations.count("service.unregister") >= 1
+        assert owner.runtime is not None
+        assert owner.account_client is not None
+        assert owner.market_client is not None
+    finally:
+        for registry in stack["registries"]:
+            registry.close()
+
+
+def test_dual_host_owner_retry_accepts_transient_transport_close_failure(tmp_path):
+    stack = _make_dual_host_stack(Environment.PAPER, tmp_path)
+    owner = stack["owner"]
+    try:
+        assert stack["factory"].preflight(
+            stack["spec"].route,
+            run_id="dual-host-transient-transport-close",
+        ) is True
+        assert stack["factory"].build() is owner
+        stack["transport"].close_failures_remaining = 1
+
+        with pytest.raises(SdkReadOnlyError) as first_close:
+            owner.close()
+
+        assert first_close.value.code == "sdk_runtime_close_failed"
+        assert owner.retained is True
+        assert owner.state == "close_failed"
+        assert owner.runtime.state == "close_failed"
+        assert owner.runtime.bindings == ()
+        assert owner.runtime.cleanup_failures == 1
+        assert owner.runtime.unregister_uncertainties == 0
+        assert owner.runtime.unknown_registration_count == 0
+        assert stack["transport"].closed is False
+        assert stack["market_transport"].closed is True
+
+        owner.close()
+
+        assert owner.retained is False
+        assert owner.state == "closed"
+        assert owner.runtime.state == "closed"
+        assert owner.runtime.cleanup_failures == 1
+        assert owner.runtime.unregister_uncertainties == 0
+        assert owner.runtime.unknown_registration_count == 0
+        assert all(transport.closed for transport in stack["transports"])
+    finally:
+        for registry in stack["registries"]:
+            registry.close()
 
 
 def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(

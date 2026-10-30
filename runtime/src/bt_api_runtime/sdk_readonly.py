@@ -107,6 +107,48 @@ class SdkMarketSourceExpectation:
 
 
 @dataclass(frozen=True)
+class SdkReadOnlyTargetV2:
+    """One code-owned SDK target inside a route-level endpoint bundle.
+
+    The route endpoint reference identifies the logical deployment bundle;
+    this value identifies one physical SDK binding in that bundle. Peer and
+    security-profile values are supplied by application code and are checked
+    against parsed configuration. Configuration declarations never create or
+    authorize these trust expectations.
+    """
+
+    service_id: str
+    instance_id: str
+    transport_ref: str
+    security_profile_ref: str
+    peer: object
+    rpc_endpoint: str
+    market_endpoint: str | None
+
+    def __repr__(self) -> str:
+        return "SdkReadOnlyTargetV2(redacted=True)"
+
+
+@dataclass(frozen=True)
+class SdkReadOnlyTargetsV2:
+    """Code-owned account/market bindings within route endpoint/credential bundles.
+
+    ``endpoint_ref`` and ``credential_ref`` are logical bundle references that
+    must match the selected route's endpoint and credential translations. The
+    nested physical targets provide each binding's independent peer and
+    security-profile expectation.
+    """
+
+    endpoint_ref: str
+    credential_ref: str
+    account: SdkReadOnlyTargetV2
+    market: SdkReadOnlyTargetV2
+
+    def __repr__(self) -> str:
+        return "SdkReadOnlyTargetsV2(redacted=True)"
+
+
+@dataclass(frozen=True)
 class SdkReadOnlySpecV2:
     """Typed code-owned inputs for one account-plus-market read-only client.
 
@@ -114,9 +156,13 @@ class SdkReadOnlySpecV2:
     ``parse_client_config``. The nine reference pairs are deliberately
     separate from that config: the I52 grammar and SDK reference grammar need
     not match. The remaining fields bind those pairs to the exact SDK identity,
-    account, endpoint, scopes, instrument, source and clock supplied by the
-    deployment. ``market_source_expectation`` is an independent code-owned
-    declaration checked against each descriptor returned by the SDK.
+    account, endpoint bundle, scopes, instrument, source and clock supplied by
+    the deployment. When ``targets`` is absent, the historical host fields are
+    normalized to two identical targets. An explicit target bundle keeps the
+    route endpoint/credential refs logical while binding each mount to its own
+    service, instance, transport, profile, peer and endpoints.
+    ``market_source_expectation`` is an independent code-owned declaration
+    checked against each descriptor returned by the SDK.
 
     ``transport_factory`` and ``subscriber_factory`` replace only the SDK's
     outer I/O leaves. The SDK runtime, account/market facades and
@@ -163,6 +209,7 @@ class SdkReadOnlySpecV2:
     qty_unit: str
     transport_factory: Callable[[Any, Any], Any]
     subscriber_factory: Callable[[Any, Any], Any]
+    targets: SdkReadOnlyTargetsV2 | None = None
 
     def __repr__(self) -> str:
         return "SdkReadOnlySpecV2(redacted=True)"
@@ -203,6 +250,83 @@ _REGISTERED_RUN_CHECK_CODES = frozenset(
         "sdk_public_stream_scope_mismatch",
     )
 )
+
+
+def _targets_for_spec(
+    spec: SdkReadOnlySpecV2,
+) -> tuple[SdkReadOnlyTargetsV2, dict[str, SdkReadOnlyTargetV2]]:
+    """Return the explicit bundle, normalizing historical single-host specs."""
+
+    targets = spec.targets
+    if targets is None:
+        single = SdkReadOnlyTargetV2(
+            service_id=spec.service_id,
+            instance_id=spec.instance_id,
+            transport_ref=spec.transport_ref,
+            security_profile_ref=spec.security_profile_ref,
+            peer=spec.peer,
+            rpc_endpoint=spec.rpc_endpoint,
+            market_endpoint=spec.market_endpoint,
+        )
+        targets = SdkReadOnlyTargetsV2(
+            endpoint_ref=spec.transport_ref,
+            credential_ref=spec.security_profile_ref,
+            account=single,
+            market=single,
+        )
+    if type(targets) is not SdkReadOnlyTargetsV2:
+        raise SdkReadOnlyError("invalid_sdk_target_bundle") from None
+    if (
+        type(targets.account) is not SdkReadOnlyTargetV2
+        or type(targets.market) is not SdkReadOnlyTargetV2
+    ):
+        raise SdkReadOnlyError("invalid_sdk_target_bundle") from None
+    return targets, {
+        "store.account": targets.account,
+        "store.market": targets.market,
+    }
+
+
+def _target_pair_shares_profile(
+    account: SdkReadOnlyTargetV2,
+    market: SdkReadOnlyTargetV2,
+) -> bool:
+    """Whether both targets declare one profile with identical endpoints/security."""
+
+    return (
+        _string(account.transport_ref)
+        and _string(market.transport_ref)
+        and account.transport_ref == market.transport_ref
+        and _string(account.security_profile_ref)
+        and _string(market.security_profile_ref)
+        and account.security_profile_ref == market.security_profile_ref
+        and _string(account.rpc_endpoint)
+        and _string(market.rpc_endpoint)
+        and account.rpc_endpoint == market.rpc_endpoint
+        and _string(account.market_endpoint)
+        and _string(market.market_endpoint)
+        and account.market_endpoint == market.market_endpoint
+    )
+
+
+def _target_profile_endpoints(
+    target: SdkReadOnlyTargetV2,
+    mount: str,
+    *,
+    shared_profile: bool = False,
+) -> dict[str, str] | None:
+    """Return the exact client endpoint map required for one target."""
+
+    if mount == "store.market" and not _string(target.market_endpoint):
+        return None
+    if mount == "store.account" and target.market_endpoint is not None and not shared_profile:
+        return None
+    endpoints = {"rpc_connect": target.rpc_endpoint}
+    if target.market_endpoint is not None:
+        if not _string(target.market_endpoint):
+            return None
+        endpoints["market_connect"] = target.market_endpoint
+    return endpoints
 
 
 def _load_sdk() -> dict[str, Any]:
@@ -429,7 +553,7 @@ def _scope_matches(
     return True
 
 
-def _validate_config(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, Any]:
+def _validate_config(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, dict[str, Any]]:
     config = spec.client_config
     if type(config) is not sdk["ClientConfig"]:
         raise SdkReadOnlyError("client_config_type_mismatch") from None
@@ -472,71 +596,82 @@ def _validate_config(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, 
         by_mount[mount] = row
     if set(by_mount) != {"store.account", "store.market"}:
         raise SdkReadOnlyError("client_config_mount_set_mismatch") from None
-    account = by_mount["store.account"]
-    market = by_mount["store.market"]
-    account_fields = {
-        "mount",
-        "service_id",
-        "instance_id",
-        "scope_ref",
-        "transport_ref",
-        "required",
-        "account_ref",
+    _targets, target_by_mount = _targets_for_spec(spec)
+    account_target = target_by_mount["store.account"]
+    market_target = target_by_mount["store.market"]
+    shared_profile = _target_pair_shares_profile(account_target, market_target)
+    if account_target.market_endpoint is not None and not shared_profile:
+        raise SdkReadOnlyError("client_config_endpoint_mismatch") from None
+    expected_bindings = {
+        "store.account": {
+            "mount": "store.account",
+            "service_id": target_by_mount["store.account"].service_id,
+            "instance_id": target_by_mount["store.account"].instance_id,
+            "scope_ref": spec.account_scope_ref,
+            "transport_ref": target_by_mount["store.account"].transport_ref,
+            "required": True,
+            "account_ref": spec.account_ref,
+        },
+        "store.market": {
+            "mount": "store.market",
+            "service_id": target_by_mount["store.market"].service_id,
+            "instance_id": target_by_mount["store.market"].instance_id,
+            "scope_ref": spec.market_scope_ref,
+            "transport_ref": target_by_mount["store.market"].transport_ref,
+            "required": True,
+        },
     }
-    market_fields = {
-        "mount",
-        "service_id",
-        "instance_id",
-        "scope_ref",
-        "transport_ref",
-        "required",
-    }
-    if set(account) != account_fields or set(market) != market_fields:
-        raise SdkReadOnlyError("client_config_mount_set_mismatch") from None
-    if account.get("required") is not True or market.get("required") is not True:
-        raise SdkReadOnlyError("client_config_required_mount_mismatch") from None
-    common = {
-        "service_id": spec.service_id,
-        "instance_id": spec.instance_id,
-        "transport_ref": spec.references.endpoint.sdk_ref,
-    }
-    for row in (account, market):
-        if any(row.get(name) != expected for name, expected in common.items()):
+    for mount, expected in expected_bindings.items():
+        row = by_mount[mount]
+        if set(row) != set(expected):
+            raise SdkReadOnlyError("client_config_mount_set_mismatch") from None
+        if row.get("required") is not True:
+            raise SdkReadOnlyError("client_config_required_mount_mismatch") from None
+        if any(row.get(name) != value for name, value in expected.items()):
+            if row.get("scope_ref") != expected["scope_ref"]:
+                raise SdkReadOnlyError("client_config_scope_mismatch") from None
             raise SdkReadOnlyError("client_config_endpoint_mismatch") from None
-    if (
-        account.get("scope_ref") != spec.references.scope.sdk_ref
-        or market.get("scope_ref") != spec.market_scope_ref
-        or account.get("account_ref") != spec.references.account.sdk_ref
-    ):
-        raise SdkReadOnlyError("client_config_scope_mismatch") from None
     communication = public.get("communication")
-    if type(communication) is not dict or set(communication) != {"config_schema_version", "profiles"}:
-        raise SdkReadOnlyError("client_config_endpoint_mismatch") from None
-    profiles = communication.get("profiles")
-    if type(profiles) is not dict or set(profiles) != {spec.references.endpoint.sdk_ref}:
-        raise SdkReadOnlyError("client_config_endpoint_mismatch") from None
-    profile = profiles[spec.references.endpoint.sdk_ref]
-    if type(profile) is not dict or set(profile) != {
-        "backend",
+    if type(communication) is not dict or set(communication) != {
         "config_schema_version",
-        "endpoints",
-        "security_profile_ref",
-        "options",
+        "profiles",
     }:
         raise SdkReadOnlyError("client_config_endpoint_mismatch") from None
-    endpoints = profile.get("endpoints")
-    if (
-        type(endpoints) is not dict
-        or endpoints != {
-            "rpc_connect": spec.rpc_endpoint,
-            "market_connect": spec.market_endpoint,
-        }
-        or profile.get("security_profile_ref") != spec.references.credential.sdk_ref
-    ):
+    profiles = communication.get("profiles")
+    expected_profile_refs = {target.transport_ref for target in target_by_mount.values()}
+    if type(profiles) is not dict or set(profiles) != expected_profile_refs:
         raise SdkReadOnlyError("client_config_endpoint_mismatch") from None
-    if profile.get("backend") != "zmq":
-        raise SdkReadOnlyError("client_config_backend_unsupported") from None
-    return profile
+    expected_profiles: dict[str, dict[str, Any]] = {}
+    for mount, target in target_by_mount.items():
+        profile = profiles.get(target.transport_ref)
+        if type(profile) is not dict or set(profile) != {
+            "backend",
+            "config_schema_version",
+            "endpoints",
+            "security_profile_ref",
+            "options",
+        }:
+            raise SdkReadOnlyError("client_config_endpoint_mismatch") from None
+        endpoints = _target_profile_endpoints(
+            target,
+            mount,
+            shared_profile=shared_profile,
+        )
+        if (
+            endpoints is None
+            or type(profile.get("endpoints")) is not dict
+            or profile.get("endpoints") != endpoints
+            or profile.get("security_profile_ref") != target.security_profile_ref
+            or profile.get("config_schema_version") != 1
+        ):
+            raise SdkReadOnlyError("client_config_endpoint_mismatch") from None
+        if profile.get("backend") != "zmq":
+            raise SdkReadOnlyError("client_config_backend_unsupported") from None
+        previous = expected_profiles.get(target.transport_ref)
+        if previous is not None and previous != profile:
+            raise SdkReadOnlyError("client_config_endpoint_mismatch") from None
+        expected_profiles[target.transport_ref] = dict(profile)
+    return expected_profiles
 
 
 def _validate_spec(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, Any]:
@@ -576,6 +711,14 @@ def _validate_spec(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, An
             or pair.route_ref != route_ref
         ):
             raise SdkReadOnlyError("route_reference_mapping_mismatch") from None
+    targets, target_by_mount = _targets_for_spec(spec)
+    if (
+        not _string(targets.endpoint_ref)
+        or not _string(targets.credential_ref)
+        or targets.endpoint_ref != pairs.endpoint.sdk_ref
+        or targets.credential_ref != pairs.credential.sdk_ref
+    ):
+        raise SdkReadOnlyError("sdk_route_bundle_mismatch") from None
     if any(
         not _string(value)
         for value in (
@@ -628,7 +771,6 @@ def _validate_spec(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, An
     ):
         raise SdkReadOnlyError("invalid_sdk_market_source_expectation") from None
     identity = spec.identity
-    peer = spec.peer
     account_key = spec.account_key
     account_resource = spec.account_resource
     instrument = spec.instrument
@@ -636,17 +778,61 @@ def _validate_spec(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, An
     account_scope = spec.account_scope
     market_scope = spec.market_scope
     stream_scope = spec.stream_scope
+    account_target = target_by_mount["store.account"]
+    market_target = target_by_mount["store.market"]
+    shared_profile = _target_pair_shares_profile(account_target, market_target)
+    if account_target.market_endpoint is not None and not shared_profile:
+        raise SdkReadOnlyError("sdk_target_identity_or_endpoint_mismatch") from None
+    for mount, target in target_by_mount.items():
+        endpoint_map = _target_profile_endpoints(
+            target,
+            mount,
+            shared_profile=shared_profile,
+        )
+        if (
+            any(
+                not _string(value)
+                for value in (
+                    target.service_id,
+                    target.instance_id,
+                    target.transport_ref,
+                    target.security_profile_ref,
+                    target.rpc_endpoint,
+                )
+            )
+            or (target.market_endpoint is not None and not _string(target.market_endpoint))
+            or endpoint_map is None
+            or type(target.peer) is not sdk["WireIdentity"]
+            or target.peer.role is not sdk["WireRole"].SERVICE
+            or target.peer.actor_ref != target.service_id
+            or not _string(target.peer.principal_ref)
+            or target.peer.delegate_ref is not None
+        ):
+            raise SdkReadOnlyError("sdk_target_identity_or_endpoint_mismatch") from None
+    if type(spec.peer) is not sdk["WireIdentity"]:
+        raise SdkReadOnlyError("sdk_identity_or_domain_type_mismatch") from None
+    if (
+        account_target.service_id != spec.service_id
+        or account_target.instance_id != spec.instance_id
+        or account_target.transport_ref != spec.transport_ref
+        or account_target.security_profile_ref != spec.security_profile_ref
+        or account_target.peer != spec.peer
+        or account_target.rpc_endpoint != spec.rpc_endpoint
+        or market_target.market_endpoint != spec.market_endpoint
+        or account_target.peer.principal_ref != spec.service_principal_ref
+    ):
+        raise SdkReadOnlyError("sdk_legacy_account_target_mismatch") from None
+    if (
+        account_target.service_id == market_target.service_id
+        and account_target.peer != market_target.peer
+    ):
+        raise SdkReadOnlyError("sdk_target_peer_conflict") from None
     if (
         type(identity) is not sdk["WireIdentity"]
         or identity.role is not sdk["WireRole"].STRATEGY_CLIENT
         or identity.actor_ref != pairs.strategy.sdk_ref
         or identity.principal_ref != spec.client_principal_ref
         or identity.delegate_ref is not None
-        or type(peer) is not sdk["WireIdentity"]
-        or peer.role is not sdk["WireRole"].SERVICE
-        or peer.actor_ref != spec.service_id
-        or peer.principal_ref != spec.service_principal_ref
-        or peer.delegate_ref is not None
         or type(account_key) is not sdk["AccountKey"]
         or type(account_resource) is not sdk["AccountResourceKey"]
         or account_resource.product_type != spec.product_type
@@ -674,8 +860,6 @@ def _validate_spec(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, An
         or subscription_key.source_ref != spec.data_source_ref
         or subscription_key.entitlement_ref != spec.entitlement_ref
         or pairs.clock.sdk_ref != spec.clock_binding.sdk_ref
-        or pairs.endpoint.sdk_ref != spec.transport_ref
-        or pairs.credential.sdk_ref != spec.security_profile_ref
         or pairs.scope.sdk_ref != spec.account_scope_ref
     ):
         raise SdkReadOnlyError("sdk_route_binding_mismatch") from None
@@ -708,8 +892,8 @@ def _validate_spec(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, An
         raise SdkReadOnlyError("sdk_scope_or_market_mapping_mismatch") from None
     if spec.account_scope_ref == spec.market_scope_ref:
         raise SdkReadOnlyError("sdk_scope_mapping_ambiguous") from None
-    profile = _validate_config(spec, sdk)
-    return profile
+    profiles = _validate_config(spec, sdk)
+    return profiles
 
 
 def _verify_registered_run_bindings(
@@ -724,6 +908,7 @@ def _verify_registered_run_bindings(
     if type(getattr(runtime, "run_id", None)) is not str or runtime.run_id != run_id:
         raise SdkReadOnlyError("sdk_runtime_run_id_mismatch") from None
 
+    _targets, target_by_mount = _targets_for_spec(spec)
     expected_scopes = {
         "store.account": replace(
             spec.account_scope,
@@ -750,6 +935,17 @@ def _verify_registered_run_bindings(
             if mount not in expected_scopes or mount in by_mount:
                 raise SdkReadOnlyError("sdk_registered_binding_set_mismatch") from None
             by_mount[mount] = binding
+            target = target_by_mount[mount]
+            expected_scope_ref = (
+                spec.account_scope_ref if mount == "store.account" else spec.market_scope_ref
+            )
+            if (
+                binding.service_id != target.service_id
+                or binding.instance_id != target.instance_id
+                or binding.scope_ref != expected_scope_ref
+                or binding.transport_ref != target.transport_ref
+            ):
+                raise SdkReadOnlyError("sdk_registered_binding_view_mismatch") from None
             if binding.active is not True:
                 raise SdkReadOnlyError("sdk_registered_binding_inactive") from None
             if (
@@ -778,20 +974,27 @@ def _verify_registered_run_bindings(
             ("store.account", account_view),
             ("store.market", market_view),
         ):
+            target = target_by_mount[mount]
             expected_scope_ref = (
-                spec.account_scope_ref
-                if mount == "store.account"
-                else spec.market_scope_ref
+                spec.account_scope_ref if mount == "store.account" else spec.market_scope_ref
             )
             if (
                 view.mount != mount
-                or view.service_id != spec.service_id
-                or view.instance_id != spec.instance_id
+                or view.service_id != target.service_id
+                or view.instance_id != target.instance_id
                 or view.scope_ref != expected_scope_ref
                 or view.rpc_scope != by_mount[mount].scope
                 or view.operations != expected_operations[mount]
+                or view.transport_ref != target.transport_ref
             ):
                 raise SdkReadOnlyError("sdk_registered_binding_view_mismatch") from None
+        if (
+            market_view.peer != target_by_mount["store.market"].peer
+            or market_view.market_endpoint != target_by_mount["store.market"].market_endpoint
+            or market_view.security_profile_ref
+            != target_by_mount["store.market"].security_profile_ref
+        ):
+            raise SdkReadOnlyError("sdk_registered_binding_view_mismatch") from None
         if account_view.account_ref != spec.account_ref:
             raise SdkReadOnlyError("sdk_registered_binding_view_mismatch") from None
     except SdkReadOnlyError:
@@ -815,9 +1018,10 @@ class SdkReadOnlyResourceOwner:
     The owner keeps strong references to every successfully constructed
     resource. It closes the proxy/facades first, and calls the shared SDK
     runtime's close only after that facade boundary returns successfully. A
-    failed or uncertain close leaves the whole group available for an explicit
-    owner-thread retry. Remote uncertainty is reported as unresolved; retry is
-    an opportunity, not a promise that the remote service will confirm it.
+    failed local close leaves the whole group available for an explicit
+    owner-thread retry. Remote unregister uncertainty remains retained for
+    reconciliation; closing a local transport or retrying does not prove
+    remote release or expiry.
     """
 
     __slots__ = (
@@ -910,7 +1114,7 @@ class SdkReadOnlyResourceOwner:
         return state, cleanup_failures, unregister_uncertainties, unknown_registration_count
 
     def close(self) -> None:
-        """Close the facade group, then its runtime; retain on any uncertainty."""
+        """Close the facade group and runtime, retaining local or remote uncertainty."""
 
         self._assert_owner_thread()
         if self._closed:
@@ -963,7 +1167,10 @@ class SdkReadOnlyResourceOwner:
         if after is None:
             self._state = "remote_uncertain"
             raise SdkReadOnlyError("sdk_runtime_cleanup_unobserved") from None
-        if after[0] not in {"closed", "absent"} or any(after[1:]):
+        # cleanup_failures is cumulative history. SDK state "closed" means its
+        # active transport map is empty; remote unknowns remain fail-closed via
+        # the two explicit uncertainty counters below.
+        if after[0] not in {"closed", "absent"} or after[2] or after[3]:
             self._state = "remote_uncertain"
             raise SdkReadOnlyError("sdk_runtime_cleanup_unconfirmed") from None
         self._state = "closed"
@@ -983,7 +1190,7 @@ class SdkReadOnlyFacadeFactory:
     __slots__ = (
         "_owner",
         "_owner_thread_id",
-        "_profile",
+        "_profiles",
         "_run_id",
         "_sdk",
         "_spec",
@@ -996,7 +1203,7 @@ class SdkReadOnlyFacadeFactory:
         self._spec = spec
         self._owner = SdkReadOnlyResourceOwner()
         self._owner_thread_id = threading.get_ident()
-        self._profile = None
+        self._profiles = None
         self._run_id = None
         self._sdk = None
         self._used = False
@@ -1030,7 +1237,7 @@ class SdkReadOnlyFacadeFactory:
         if type(selected_route) is not TrustedRouteV2 or selected_route != self._spec.route:
             raise SdkReadOnlyError("sdk_selected_route_mismatch") from None
         sdk = _load_sdk()
-        self._profile = _validate_spec(self._spec, sdk)
+        self._profiles = _validate_spec(self._spec, sdk)
         self._sdk = sdk
         self._run_id = run_id
         return True
@@ -1045,11 +1252,11 @@ class SdkReadOnlyFacadeFactory:
                 raise SdkReadOnlyError("sdk_run_identity_invalid") from None
             if self._run_id is not None and self._run_id != run_id:
                 raise SdkReadOnlyError("sdk_run_identity_mismatch") from None
-            if self._profile is None:
+            if self._profiles is None:
                 self.preflight(self._spec.route, run_id=run_id)
         if self._run_id is None:
             raise SdkReadOnlyError("sdk_run_identity_required") from None
-        if self._profile is None:
+        if self._profiles is None:
             raise SdkReadOnlyError("sdk_factory_preflight_required") from None
         self._used = True
 
@@ -1058,11 +1265,12 @@ class SdkReadOnlyFacadeFactory:
         # ClientConfig checks run before constructing the SDK runtime or calling
         # an I/O factory.
         sdk = self._sdk
-        profile = self._profile
-        if type(profile) is not dict or type(sdk) is not dict:
+        profiles = self._profiles
+        if type(profiles) is not dict or type(sdk) is not dict:
             raise SdkReadOnlyError("sdk_factory_preflight_unavailable") from None
         spec = self._spec
         run_id = self._run_id
+        _targets, target_by_mount = _targets_for_spec(spec)
 
         def scope_resolver(scope_ref: str):
             if scope_ref == spec.account_scope_ref:
@@ -1071,13 +1279,19 @@ class SdkReadOnlyFacadeFactory:
                 return spec.market_scope
             raise KeyError(scope_ref)
 
-        def peer_resolver(service_id: str):
-            return spec.peer if service_id == spec.service_id else None
+        peer_by_service = {}
+        for target in target_by_mount.values():
+            peer_by_service.setdefault(target.service_id, target.peer)
 
-        expected_profile = dict(profile)
+        def peer_resolver(service_id: str):
+            return peer_by_service.get(service_id)
 
         def transport_factory(actual_profile: Any, actual_peer: Any):
-            if actual_profile != expected_profile or actual_peer is not spec.peer:
+            matched = any(
+                actual_peer == target.peer and actual_profile == profiles[target.transport_ref]
+                for target in target_by_mount.values()
+            )
+            if not matched:
                 raise SdkReadOnlyError("sdk_transport_binding_changed") from None
             return spec.transport_factory(actual_profile, actual_peer)
 
