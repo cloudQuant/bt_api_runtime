@@ -3,8 +3,9 @@
 ## System role and authority boundary
 
 The independently built [`contracts/`](contracts/README.md) package provides a
-pure-data configuration parser for the initial I52 schema. It does not resolve
-references or grant permissions. Strategy preflight and session orchestration
+pure-data configuration parser and symbolic route matcher for the initial I52
+schema. Matching uses a caller-supplied registry; it does not establish actual
+resource identity or grant permissions. Strategy preflight and session orchestration
 remain a proposal: this repository does not yet perform runtime preflight,
 enable plugins, orchestrate sessions, or grant trading authorization. Existing
 runtime behavior remains in Backtrader until a separately verified migration.
