@@ -14,6 +14,8 @@ from bt_api_run_contract import (
     TrustedRegistry,
     TrustedRoute,
     ValidatedRunConfig,
+    ValidatedRunConfigV2,
+    parse_config,
     resolve_plan,
     validate_plan,
 )
@@ -219,6 +221,39 @@ class TrustedRegistryTests(unittest.TestCase):
         self.assert_code("invalid_route", TrustedRoute, "paper", route.references)
         self.assert_code("invalid_route", TrustedRoute)
         self.assert_code("invalid_registry", TrustedRegistry)
+
+    def test_v2_resolution_is_explicitly_deferred_without_changing_v1_plan_tuple(self):
+        config_v2 = parse_config(
+            "schema_version: 2\n"
+            "mode: paper\n"
+            "environment: paper\n"
+            "references:\n"
+            "  strategy: strategy/example\n"
+            "  provider: provider/example\n"
+            "  endpoint: endpoint/example\n"
+            "  account: account/example\n"
+            "  credential: credential/example\n"
+            "  scope: scope/example\n"
+            "  product: product/example\n"
+            "  data_source: data_source/example\n"
+            "  clock: clock/example\n"
+            "plugins: {}\n"
+            "strategy_parameters: {}\n"
+            "requested_capabilities: []\n"
+        )
+        self.assertIs(type(config_v2), ValidatedRunConfigV2)
+        self.assert_code("schema_v2_resolution_deferred", resolve_plan, config_v2, object())
+
+        route = TrustedRoute(Environment.PAPER, _references())
+        registry = TrustedRegistry((route,))
+        config_v1 = _config(route.references)
+        plan = resolve_plan(config_v1, registry)
+        self.assertEqual(tuple.__len__(plan), 8)
+        self.assertEqual(
+            tuple.__getitem__(plan, slice(0, 2)),
+            (RunMode.PAPER, Environment.PAPER),
+        )
+        self.assert_code("schema_v2_resolution_deferred", validate_plan, plan, config_v2, registry)
 
     def test_enabled_plugins_are_explicitly_deferred(self):
         route = TrustedRoute(Environment.PAPER, _references())

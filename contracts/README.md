@@ -1,9 +1,14 @@
 # bt-api-run-contract
 
 This directory is an independent build root for the `bt_api_run_contract`
-package. It has one versioned YAML schema and depends at runtime only on
-PyYAML and the Python standard library. Package metadata is version `0.1.1` for
+package. It has two explicitly versioned YAML schemas and depends at runtime only on
+PyYAML and the Python standard library. Package metadata is version `0.1.2` for
 this source candidate; this change is not a release.
+
+The 0.1.2 wheel was built and tested from separate target directories on
+Python 3.8 and 3.11 (47 tests each). The target checks used the existing
+interpreter environments and are not isolated dependency or release validation.
+Wheel SHA-256: `4cda8c352accda36321207c0c7bc642d9d80c105e1cedf4da9a4f6d5a5f4b27c`.
 
 Schema version 1 accepts `paper` and `live` configuration documents. The
 `mode` and `environment` must match. The names `replay` and `shadow` are
@@ -70,6 +75,95 @@ providers, credential sources, endpoints, factories, or plugins. Any enabled
 plugin currently fails with `plugin_resolution_deferred`; plugin registration,
 availability, and dependency checks remain a separate fail-closed design.
 Disabled plugin declarations are not copied into `ResolvedPlan`.
+
+## Schema version 2 source candidate
+
+`parse_config` is the single parser owner and dispatches on the explicit
+`schema_version`. `SCHEMA_VERSION` remains `1` for compatibility;
+`SCHEMA_V2_VERSION` is `2`. Version 1 keeps its existing parser result,
+reference model, plugin behavior, and resolver tuple.
+
+Version 2 returns a separate frozen `ValidatedRunConfigV2` DTO. Its
+`ReferencesV2` has nine field-typed symbolic identifiers: the existing
+`strategy`, `provider`, `endpoint`, `account`, `credential`, and `scope`, plus
+`product`, `data_source`, and `clock`.
+
+```yaml
+schema_version: 2
+mode: paper
+environment: paper
+references:
+  strategy: strategy/intraday_v2
+  provider: provider/binance_usdm
+  endpoint: endpoint/binance_paper
+  account: account/paper_primary
+  credential: credential/paper_trading
+  scope: scope/usdm_paper_orders
+  product: product/binance_usdm
+  data_source: data_source/market_feed
+  clock: clock/exchange_utc
+plugins:
+  gateway: true
+  risk: false
+  monitor: true
+  execution: false
+  runtime: true
+strategy_parameters:
+  window: 20
+  threshold: 0.5
+  use_filter: true
+requested_capabilities:
+  - market.read
+  - account.read
+  - orders.paper.write
+```
+
+Paper and live require the matching `environment`. The parser recognizes
+`replay` and `shadow`, then rejects them with `mode_deferred`; those modes do
+not produce a DTO. `resolve_plan` also rejects every v2 DTO with
+`schema_v2_resolution_deferred`. Version 2 does not extend or alter the
+accepted version-1 `ResolvedPlan` tuple, and the static capability requests
+cannot authorize an operation.
+
+`plugins` is required and retains at most 64 named boolean switches with the
+version-1 plugin-name grammar, including the gateway, risk, monitor, execution,
+and runtime component names used by the candidate. Enabled switches are
+preserved in the DTO; parsing does not load, resolve, or authorize a plugin.
+
+`strategy_parameters` is a mapping with at most 64 Python identifier names of
+at most 64 characters and 128 UTF-8 bytes (including normal mixed-case
+identifiers; Python keywords are rejected).
+Values may be YAML null, booleans, signed 32-bit integers, finite floats with
+absolute value at most `1e12`, strings of at most 256 characters and 512 UTF-8
+bytes, lists, or string-keyed mappings. Strings may be empty; control
+characters are rejected. Each nested list or mapping has at most 64 entries,
+the value tree is at most 8 levels deep and contains at most 512 scalar and
+container nodes, and nested keys use the same string length/byte bounds. The
+parser converts lists and maps to the immutable `StrategyParameterList` and
+`StrategyParameterMap` wrappers, sorts mapping entries, and rejects non-finite
+floats or other Python objects such as dates. These structural bounds do not
+replace validation by a strategy's parameter descriptor. The DTO and nested
+wrappers omit parameter values from their representations.
+
+Call `ValidatedRunConfigV2.strategy_parameters_dict()` or a nested wrapper's
+`to_python()` for fresh ordinary dictionaries and lists. No v2 runtime adapter
+is implemented; the deferred resolver and strategy assembly must lower these
+copies through a reviewed descriptor path instead of passing immutable wrapper
+objects to a strategy.
+
+`requested_capabilities` is a unique list of at most four values from
+`market.read`, `account.read`, `orders.paper.write`, and
+`orders.live.write`. A paper config cannot request live writes; a live config
+cannot request paper writes. This field records a request only. It does not
+grant permission, and no version-2 resolver or execution path is implemented.
+
+Version 2 uses the same UTF-8 input bound (64 KiB), YAML event bound (8,192),
+and collection-depth bound (32) as version 1. Duplicate keys, aliases,
+anchors, tags, multiple documents, and unknown fields remain rejected. The
+parser consumes only caller-provided text or bytes; it does not read files,
+environment variables, or network services and does not import or execute a
+strategy, provider, plugin, or factory. V1 plugin fields and old schema-v4 or
+local-simulation fields are not migrated into version 2.
 
 The current registry contains symbolic strings only; it has no authoritative
 account, endpoint, credential, or strategy objects whose identities it could

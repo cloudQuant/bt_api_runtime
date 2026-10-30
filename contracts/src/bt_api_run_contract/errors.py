@@ -16,12 +16,31 @@ _MESSAGES: Dict[str, str] = {
     "unknown_field": "Config contains an unknown field.",
     "invalid_schema_version": "Config schema version is invalid.",
     "unsupported_schema_version": "Config schema version is not supported.",
+    "schema_v2_resolution_deferred": (
+        "Schema version 2 resolution is deferred; no executable plan is produced."
+    ),
     "invalid_mode": "Config mode is invalid.",
     "mode_deferred": "This mode is recognized but deferred and cannot produce a run config.",
     "invalid_environment": "Config environment is invalid.",
     "environment_mismatch": "Config mode and environment do not match.",
     "invalid_references": "Config references must be a mapping of symbolic identifiers.",
     "invalid_reference": "Config contains an invalid symbolic reference.",
+    "invalid_strategy_parameters": (
+        "Strategy parameters must be a bounded mapping of pure-data values."
+    ),
+    "strategy_parameters_too_large": "Config contains too many strategy parameters.",
+    "invalid_strategy_parameter_name": "Config contains an invalid strategy parameter name.",
+    "invalid_strategy_parameter_value": (
+        "Config contains an invalid or out-of-bounds strategy parameter value."
+    ),
+    "invalid_capabilities": (
+        "Requested capabilities must be a bounded sequence of known identifiers."
+    ),
+    "unknown_capability": "Config requests an unsupported capability.",
+    "duplicate_capability": "Config requests a capability more than once.",
+    "capability_mode_mismatch": (
+        "A requested write capability does not match the selected mode."
+    ),
     "invalid_plugins": "Config plugins must be a mapping of symbolic identifiers to booleans.",
     "invalid_plugin_name": "Config contains an invalid plugin identifier.",
     "invalid_plugin_value": "Every plugin value must be an explicit YAML boolean.",

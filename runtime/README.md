@@ -1,14 +1,19 @@
 # `bt-api-runtime`
 
 This separately defined build root contains the first I52 A1 runtime assembly
-candidate. A wheel was built (SHA-256
+candidate. The earlier 0.1.0 wheel was built (SHA-256
 `f06c318e65efd756d8ae38b3fd573fd94f1e13220c0bf5d2c147829fe9c248a8`) and installed to a
 separate target directory using checkout dependencies. The wheel, install target,
 and source `__init__.py` and `assembly.py` payloads matched byte-for-byte.
-It accepts only `paper` and `live` configurations resolved through
+The 0.1.1 wheel pins the contract package at 0.1.2; both installed to a
+separate target and the 25 assembly tests passed using local Backtrader and SDK
+base source dependencies. This is not isolated dependency or release validation.
+The 0.1.1 wheel SHA-256 is `591cf599b4df6a93d5992e02144dc3ae3a614eeaccbd08d4c02ff56bd9a86854`.
+It accepts only schema v1 `paper` and `live` configurations resolved through
 `bt_api_run_contract`, then assembles one ordinary Backtrader engine with
 registered `BtApiFeed` minute bars, `BtApiStore`, and a `BtApiBroker` configured
-with `market_data_only=True`.
+with `market_data_only=True`. Schema v2 parses but resolution and runtime
+assembly remain deferred.
 
 The application must construct a code-owned `RuntimeBindings` registry. Each
 route binds an ordinary `backtrader.Strategy` subclass, a fixed set of `1m` feed

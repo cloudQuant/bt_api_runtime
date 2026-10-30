@@ -7,10 +7,16 @@ provider, or authorize an order.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Tuple, Union
 
 from .errors import RunConfigError
-from .parser import Environment, References, RunMode, ValidatedRunConfig
+from .parser import (
+    Environment,
+    References,
+    RunMode,
+    ValidatedRunConfig,
+    ValidatedRunConfigV2,
+)
 
 
 _REFERENCE_FIELDS = ("strategy", "provider", "endpoint", "account", "credential", "scope")
@@ -342,7 +348,10 @@ class ResolvedPlan(tuple):
     __str__ = __repr__
 
 
-def resolve_plan(config: ValidatedRunConfig, registry: TrustedRegistry) -> ResolvedPlan:
+def resolve_plan(
+    config: Union[ValidatedRunConfig, ValidatedRunConfigV2],
+    registry: TrustedRegistry,
+) -> ResolvedPlan:
     """Match every config reference to one explicit in-memory route.
 
     This function performs only type checks and value comparisons. It does not
@@ -351,6 +360,8 @@ def resolve_plan(config: ValidatedRunConfig, registry: TrustedRegistry) -> Resol
     own registry and fail-closed availability/dependency contract.
     """
 
+    if type(config) is ValidatedRunConfigV2:
+        _raise("schema_v2_resolution_deferred")
     mode, environment, references, plugins = _config_parts(config)
     routes = _registry_routes(registry)
     _select_route(environment, references, routes)
@@ -366,7 +377,7 @@ def resolve_plan(config: ValidatedRunConfig, registry: TrustedRegistry) -> Resol
 
 def validate_plan(
     plan: ResolvedPlan,
-    config: ValidatedRunConfig,
+    config: Union[ValidatedRunConfig, ValidatedRunConfigV2],
     registry: TrustedRegistry,
 ) -> ResolvedPlan:
     """Re-resolve the config and compare it with the plan before use.
