@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -41,6 +42,7 @@ from bt_api_run_contract import (
     parse_config,
 )
 
+import bt_api_runtime.assembly as assembly_module
 from bt_api_runtime import (
     FeedSpec,
     RouteBinding,
@@ -48,11 +50,16 @@ from bt_api_runtime import (
     RuntimeAssemblyError,
     RuntimeBindings,
     RuntimeBindingsV2,
+    RuntimeCleanupReport,
     assemble_run,
 )
 
 _NOW = datetime(2026, 10, 1, 12, 3, tzinfo=timezone.utc)
 _OBSERVED_AT = "2026-10-01T12:03:00Z"
+
+
+class _CleanupAbort(BaseException):
+    """Unknown cleanup failure used to check primary-exception preservation."""
 
 
 class _AccountFacade:
@@ -996,6 +1003,565 @@ def test_request_stop_before_run_is_explicitly_not_accepted():
     assert strategy.closes == [100.5]
     assert created[0][1].close_calls == 1
     assert created[0][2].close_calls == 1
+    assert session.cleanup_report == RuntimeCleanupReport(
+        confirmed_steps=("store_stop", "proxy_disconnect")
+    )
+    assert session.cleanup_report.complete is True
+
+
+def test_run_preserves_primary_interrupt_when_base_exception_cleanup_fails_in_with():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    primary = KeyboardInterrupt("primary fixture interrupt")
+    cleanup_failure = BaseException("sensitive cleanup detail")
+    broker_stop_calls = []
+
+    def fail_engine_run():
+        raise primary
+
+    def fail_broker_stop():
+        broker_stop_calls.append("called")
+        raise cleanup_failure
+
+    session._cerebro.run = fail_engine_run
+    session._broker.stop = fail_broker_stop
+
+    with pytest.raises(KeyboardInterrupt) as caught, session:
+        session.run()
+
+    assert caught.value is primary
+    assert broker_stop_calls == ["called"]
+    assert session.cleanup_report.failed_steps == ("broker_stop",)
+    assert session.cleanup_report.pending_steps == ()
+    assert "sensitive cleanup detail" not in repr(session.cleanup_report)
+    assert session._closed is False
+    assert created[0][1].close_calls == 1
+    assert created[0][2].close_calls == 1
+
+
+def test_context_exit_preserves_body_failure_when_proxy_close_fails(monkeypatch):
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    original_disconnect = session._proxy.disconnect
+    disconnect_calls = []
+    primary = RuntimeError("primary body failure")
+
+    def fail_disconnect():
+        disconnect_calls.append("called")
+        raise RuntimeError("sensitive cleanup detail")
+
+    monkeypatch.setattr(session._proxy, "disconnect", fail_disconnect)
+    with pytest.raises(RuntimeError) as caught, session:
+        raise primary
+
+    assert caught.value is primary
+    assert disconnect_calls == ["called"]
+    assert session.cleanup_report.failed_steps == ("proxy_disconnect",)
+    assert session.cleanup_report.pending_steps == ("proxy_disconnect",)
+    assert session.cleanup_report.confirmed_steps == ()
+    assert "sensitive cleanup detail" not in repr(session.cleanup_report)
+    assert session._closed is False
+
+    monkeypatch.setattr(session._proxy, "disconnect", original_disconnect)
+    session.close()
+    assert created[0][1].close_calls == 1
+    assert created[0][2].close_calls == 1
+
+
+def test_no_feed_primary_error_survives_proxy_close_failure(monkeypatch):
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    session._cerebro.datas.clear()
+    original_disconnect = session._proxy.disconnect
+
+    def fail_disconnect():
+        raise _CleanupAbort("sensitive no-feed cleanup detail")
+
+    monkeypatch.setattr(session._proxy, "disconnect", fail_disconnect)
+    with pytest.raises(RuntimeAssemblyError) as caught:
+        session.run()
+
+    assert caught.value.code == "session_has_no_feeds"
+    assert caught.value.runtime_cleanup_report is session.cleanup_report
+    assert session.cleanup_report.failed_steps == ("proxy_disconnect",)
+    assert session.cleanup_report.pending_steps == ("proxy_disconnect",)
+    assert session.cleanup_report.complete is False
+    assert session._closed is False
+
+    monkeypatch.setattr(session._proxy, "disconnect", original_disconnect)
+    session.close()
+
+
+def test_partial_assembly_preserves_primary_and_reports_failed_proxy_cleanup(monkeypatch):
+    created = []
+    base_factory = _factory("paper", created)
+
+    def factory_with_close_failure():
+        proxy = base_factory()
+        account = created[-1][1]
+
+        def fail_account_close():
+            account.close_calls += 1
+            raise _CleanupAbort("sensitive facade close detail")
+
+        account.close = fail_account_close
+        return proxy
+
+    registry, routes = _runtime_bindings(created, paper_factory=factory_with_close_failure)
+    primary = SystemExit("primary assembly failure")
+
+    def fail_setbroker(_cerebro, _broker):
+        raise primary
+
+    monkeypatch.setattr(bt.Cerebro, "setbroker", fail_setbroker)
+    with pytest.raises(SystemExit) as caught:
+        assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+
+    assert caught.value is primary
+    report = caught.value.runtime_cleanup_report
+    assert report.failed_steps == ("proxy_disconnect",)
+    assert report.pending_steps == ("proxy_disconnect",)
+    assert report.complete is False
+    assert "sensitive facade close detail" not in repr(report)
+    proxy, account, market = created[0]
+    # The public property is false while disconnect is still closing; it is
+    # not evidence that the failing facade was released.
+    assert proxy.is_connected is False
+    assert proxy._closed is False
+    assert account.close_calls == 1
+    assert market.close_calls == 1
+
+
+def test_partial_assembly_keeps_primary_if_report_attachment_is_unavailable(monkeypatch):
+    created = []
+    registry, routes = _runtime_bindings(created)
+    primary = RuntimeError("primary assembly failure")
+
+    def fail_setbroker(_cerebro, _broker):
+        raise primary
+
+    monkeypatch.setattr(bt.Cerebro, "setbroker", fail_setbroker)
+    monkeypatch.setattr(assembly_module, "_attach_cleanup_report", lambda *_args: False)
+
+    with pytest.raises(RuntimeError) as caught:
+        assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+
+    assert caught.value is primary
+    assert not hasattr(primary, "runtime_cleanup_report")
+    proxy, account, market = created[0]
+    assert proxy.is_connected is False
+    assert account.close_calls == 1
+    assert market.close_calls == 1
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_close_preserves_control_interrupt_from_cleanup(monkeypatch, interrupt_type):
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    original_disconnect = session._proxy.disconnect
+    interrupt = interrupt_type("cleanup interrupt")
+
+    def interrupt_disconnect():
+        raise interrupt
+
+    monkeypatch.setattr(session._proxy, "disconnect", interrupt_disconnect)
+    with pytest.raises(interrupt_type) as caught:
+        session.close()
+
+    assert caught.value is interrupt
+    assert session.cleanup_report.failed_steps == ("proxy_disconnect",)
+    assert session.cleanup_report.complete is False
+    assert session._closed is False
+
+    monkeypatch.setattr(session._proxy, "disconnect", original_disconnect)
+    session.close()
+
+
+@pytest.mark.parametrize("cleanup_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_existing_run_failure_wins_over_cleanup_control_exception_in_with(cleanup_type):
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    primary = RuntimeError("primary run failure")
+    cleanup_interrupt = cleanup_type("secondary cleanup control")
+
+    def fail_engine_run():
+        raise primary
+
+    def fail_broker_stop():
+        raise cleanup_interrupt
+
+    session._cerebro.run = fail_engine_run
+    session._broker.stop = fail_broker_stop
+
+    with pytest.raises(RuntimeError) as caught, session:
+        session.run()
+
+    assert caught.value is primary
+    assert session.cleanup_report.failed_steps == ("broker_stop",)
+    assert "secondary cleanup control" not in repr(session.cleanup_report)
+    assert created[0][1].close_calls == 1
+    assert created[0][2].close_calls == 1
+
+
+def test_control_error_during_compensation_does_not_replace_store_stop_primary():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    store_stop_calls = []
+
+    def successful_engine_run():
+        return []
+
+    def fail_store_stop():
+        store_stop_calls.append("called")
+        if len(store_stop_calls) == 1:
+            raise RuntimeError("primary store cleanup detail")
+        raise GeneratorExit("secondary compensation control")
+
+    session._cerebro.run = successful_engine_run
+    session._store.stop = fail_store_stop
+
+    with pytest.raises(RuntimeAssemblyError) as caught:
+        session.run()
+
+    assert caught.value.code == "run_cleanup_failed"
+    assert store_stop_calls == ["called", "called"]
+    assert caught.value.runtime_cleanup_report is session.cleanup_report
+    assert session.cleanup_report.failed_steps == ("store_stop",)
+    assert session.cleanup_report.pending_steps == ("store_stop_unconfirmed",)
+    assert "primary store cleanup detail" not in repr(session.cleanup_report)
+    assert "secondary compensation control" not in repr(session.cleanup_report)
+    assert created[0][1].close_calls == 1
+    assert created[0][2].close_calls == 1
+
+
+def test_cleanup_report_replacement_tracks_mark_closed_failure(monkeypatch):
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    primary = RuntimeError("primary run failure")
+
+    def fail_engine_run():
+        raise primary
+
+    def fail_mark_closed(_session):
+        raise RuntimeError("MARK_STATE_SENTINEL")
+
+    session._cerebro.run = fail_engine_run
+    monkeypatch.setattr(type(session), "_mark_closed", fail_mark_closed)
+
+    with pytest.raises(RuntimeError) as caught:
+        session.run()
+
+    assert caught.value is primary
+    assert caught.value.runtime_cleanup_report is session.cleanup_report
+    assert session.cleanup_report.complete is False
+    assert session.cleanup_report.failed_steps == ("cleanup_state_unknown",)
+    assert session.cleanup_report.pending_steps == ("cleanup_state_unknown",)
+    assert created[0][1].close_calls == 1
+    assert created[0][2].close_calls == 1
+
+
+def test_unknown_store_stop_state_preserves_proxy_custody():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    original_store = session._store
+    original_disconnect = session._proxy.disconnect
+    disconnect_calls = []
+    store_stop_calls = []
+    primary = RuntimeError("primary engine failure")
+
+    class UnknownStoreState:
+        def __getattr__(self, name):
+            return getattr(original_store, name)
+
+        @property
+        def _service_read_only_stopped(self):
+            raise RuntimeError("STORE_STATE_SENTINEL")
+
+    def count_store_stop():
+        store_stop_calls.append("called")
+
+    def count_disconnect():
+        disconnect_calls.append("called")
+        return original_disconnect()
+
+    session._store = UnknownStoreState()
+    session._store.stop = count_store_stop
+    session._broker.stop = lambda: None
+    session._proxy.disconnect = count_disconnect
+    session._cerebro.run = lambda: (_ for _ in ()).throw(primary)
+
+    with pytest.raises(RuntimeError) as caught:
+        session.run()
+
+    assert caught.value is primary
+    assert store_stop_calls == []
+    assert disconnect_calls == []
+    assert session.cleanup_report.failed_steps == ("store_state",)
+    assert session.cleanup_report.pending_steps == ("store_state", "proxy_disconnect")
+    assert session.cleanup_report.complete is False
+    assert session._closed is False
+    assert created[0][1].close_calls == 0
+    assert created[0][2].close_calls == 0
+
+
+def test_close_retry_skips_confirmed_broker_but_retries_unclosed_store():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    proxy, account, market = created[0]
+    original_broker_stop = session._broker.stop
+    original_store_stop = session._store.stop
+    broker_stop_calls = []
+    store_stop_calls = []
+    primary = RuntimeError("primary run failure")
+    pending_worker = threading.Thread(target=lambda: None)
+
+    def count_broker_stop():
+        broker_stop_calls.append("called")
+        return original_broker_stop()
+
+    def count_store_stop():
+        store_stop_calls.append("called")
+        return original_store_stop()
+
+    def fail_engine_run():
+        raise primary
+
+    session._broker.stop = count_broker_stop
+    session._store.stop = count_store_stop
+    session._cerebro.run = fail_engine_run
+    with session._store._read_only_metadata_probe_condition:
+        session._store._read_only_metadata_probe_thread = pending_worker
+        session._store._read_only_metadata_probe_active = True
+
+    with pytest.raises(RuntimeError) as caught:
+        session.run()
+
+    assert caught.value is primary
+    assert broker_stop_calls == ["called"]
+    assert store_stop_calls == ["called"]
+    assert session.cleanup_report.confirmed_steps == ("broker_stop",)
+    assert session.cleanup_report.pending_steps == (
+        "store_stop_unconfirmed",
+        "metadata_probe_shutdown",
+    )
+    assert session._store._service_read_only_stopped is False
+    assert proxy._closed is False
+    assert account.close_calls == market.close_calls == 0
+    assert session._closed is False
+
+    with pytest.raises(RuntimeAssemblyError) as close_error:
+        session.close()
+
+    assert close_error.value.code == "run_cleanup_failed"
+    assert broker_stop_calls == ["called"]
+    assert store_stop_calls == ["called", "called"]
+    assert session.cleanup_report.confirmed_steps == ("broker_stop",)
+    assert session.cleanup_report.pending_steps == (
+        "store_stop_unconfirmed",
+        "metadata_probe_shutdown",
+    )
+    assert proxy._closed is False
+    assert account.close_calls == market.close_calls == 0
+    assert session._closed is False
+
+    with session._store._read_only_metadata_probe_condition:
+        session._store._read_only_metadata_probe_active = False
+        session._store._read_only_metadata_probe_thread = None
+    session.close()
+
+    assert broker_stop_calls == ["called"]
+    assert store_stop_calls == ["called", "called", "called"]
+    assert session.cleanup_report.complete is True
+    assert session._closed is True
+    assert proxy._closed is True
+    assert account.close_calls == market.close_calls == 1
+
+
+def test_close_retry_retries_unconfirmed_broker_and_finishes_owned_resources():
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    proxy, account, market = created[0]
+    original_broker_stop = session._broker.stop
+    original_store_stop = session._store.stop
+    original_disconnect = proxy.disconnect
+    broker_stop_calls = []
+    store_stop_calls = []
+    disconnect_calls = []
+    primary = RuntimeError("primary run failure")
+
+    def fail_broker_stop_once():
+        broker_stop_calls.append("called")
+        if len(broker_stop_calls) == 1:
+            raise _CleanupAbort("BROKER_STOP_EXCEPTION_SENTINEL")
+        return original_broker_stop()
+
+    def count_store_stop():
+        store_stop_calls.append("called")
+        return original_store_stop()
+
+    def count_disconnect():
+        disconnect_calls.append("called")
+        return original_disconnect()
+
+    def fail_engine_run():
+        raise primary
+
+    session._broker.stop = fail_broker_stop_once
+    session._store.stop = count_store_stop
+    proxy.disconnect = count_disconnect
+    session._cerebro.run = fail_engine_run
+
+    with pytest.raises(RuntimeError) as caught:
+        session.run()
+
+    assert caught.value is primary
+    assert broker_stop_calls == ["called"]
+    assert store_stop_calls == ["called"]
+    assert disconnect_calls == ["called"]
+    assert session.cleanup_report.failed_steps == ("broker_stop",)
+    assert session.cleanup_report.confirmed_steps == ("store_stop",)
+    assert session.cleanup_report.complete is False
+    assert "BROKER_STOP_EXCEPTION_SENTINEL" not in repr(session.cleanup_report)
+    assert session._closed is False
+
+    session.close()
+
+    assert broker_stop_calls == ["called", "called"]
+    assert store_stop_calls == ["called"]
+    assert disconnect_calls == ["called"]
+    assert session.cleanup_report.failed_steps == ()
+    assert session.cleanup_report.confirmed_steps == ("broker_stop", "store_stop")
+    assert session.cleanup_report.complete is True
+    assert session._store._service_read_only_stopped is True
+    assert session._store.is_connected is False
+    assert proxy._closed is True
+    assert account.close_calls == market.close_calls == 1
+    assert session._closed is True
+
+
+def test_unexpected_compensation_failure_is_finite_and_suppresses_store_text(monkeypatch):
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+
+    def successful_engine_run():
+        return []
+
+    def fail_store_stop():
+        raise RuntimeError("STORE_EXCEPTION_SENTINEL")
+
+    def fail_compensation(_session):
+        raise _CleanupAbort("COMPENSATION_EXCEPTION_SENTINEL")
+
+    session._cerebro.run = successful_engine_run
+    session._store.stop = fail_store_stop
+    monkeypatch.setattr(type(session), "_compensate_failed_run", fail_compensation)
+
+    with pytest.raises(RuntimeAssemblyError) as caught:
+        session.run()
+
+    assert caught.value.code == "run_cleanup_failed"
+    assert caught.value.__suppress_context__ is True
+    assert caught.value.runtime_cleanup_report is session.cleanup_report
+    assert session.cleanup_report.failed_steps == ("cleanup_state_unknown",)
+    assert session.cleanup_report.pending_steps == ("cleanup_state_unknown",)
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert "STORE_EXCEPTION_SENTINEL" not in rendered
+    assert "COMPENSATION_EXCEPTION_SENTINEL" not in rendered
+
+
+def test_store_stop_and_mark_closed_failures_keep_only_finite_cleanup_state(monkeypatch):
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    original_store_stop = session._store.stop
+    stop_calls = []
+
+    def fail_once_then_stop():
+        stop_calls.append("called")
+        if len(stop_calls) == 1:
+            raise RuntimeError("STORE_EXCEPTION_SENTINEL")
+        return original_store_stop()
+
+    def successful_engine_run():
+        return []
+
+    def fail_mark_closed(_session):
+        raise RuntimeError("MARK_STATE_SENTINEL")
+
+    session._cerebro.run = successful_engine_run
+    session._store.stop = fail_once_then_stop
+    monkeypatch.setattr(type(session), "_mark_closed", fail_mark_closed)
+
+    with pytest.raises(RuntimeAssemblyError) as caught:
+        session.run()
+
+    assert caught.value.code == "run_cleanup_failed"
+    assert caught.value.__suppress_context__ is True
+    assert stop_calls == ["called", "called"]
+    assert caught.value.runtime_cleanup_report is session.cleanup_report
+    assert session.cleanup_report.failed_steps == ("cleanup_state_unknown",)
+    assert session.cleanup_report.pending_steps == ("cleanup_state_unknown",)
+    assert session.cleanup_report.confirmed_steps == ("broker_stop", "store_stop")
+    assert session._closed is False
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert "STORE_EXCEPTION_SENTINEL" not in rendered
+    assert "MARK_STATE_SENTINEL" not in rendered
+    assert created[0][1].close_calls == 1
+    assert created[0][2].close_calls == 1
+
+
+def test_close_propagates_control_if_mark_closed_fails_without_primary(monkeypatch):
+    created = []
+    registry, routes = _runtime_bindings(created)
+    session = assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+    interrupt = GeneratorExit("mark closed control sentinel")
+
+    def fail_mark_closed(_session):
+        raise interrupt
+
+    monkeypatch.setattr(type(session), "_mark_closed", fail_mark_closed)
+
+    with pytest.raises(GeneratorExit) as caught:
+        session.close()
+
+    assert caught.value is interrupt
+    assert session.cleanup_report.failed_steps == ("cleanup_state_unknown",)
+    assert session.cleanup_report.pending_steps == ("cleanup_state_unknown",)
+    assert session._closed is False
+    assert "mark closed control sentinel" not in repr(session.cleanup_report)
+
+
+def test_partial_assembly_does_not_overwrite_existing_primary_report(monkeypatch):
+    created = []
+    registry, routes = _runtime_bindings(created)
+    primary = RuntimeError("primary assembly failure")
+    caller_report = object()
+    primary.runtime_cleanup_report = caller_report
+
+    def fail_setbroker(_cerebro, _broker):
+        raise primary
+
+    monkeypatch.setattr(bt.Cerebro, "setbroker", fail_setbroker)
+    with pytest.raises(RuntimeError) as caught:
+        assemble_run(_yaml_config(routes[Environment.PAPER]), registry)
+
+    assert caught.value is primary
+    assert primary.runtime_cleanup_report is caller_report
+    proxy, account, market = created[0]
+    assert proxy.is_connected is False
+    assert account.close_calls == 1
+    assert market.close_calls == 1
 
 
 def test_idle_live_feed_stops_from_another_thread_and_owner_cleans_resources():

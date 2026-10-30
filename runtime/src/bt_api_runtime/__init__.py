@@ -8,6 +8,7 @@ from .assembly import (
     RuntimeAssemblyError,
     RuntimeBindings,
     RuntimeBindingsV2,
+    RuntimeCleanupReport,
     assemble_run,
 )
 from .sdk_readonly import (
@@ -29,6 +30,7 @@ __all__ = [
     "RuntimeAssemblyError",
     "RuntimeBindings",
     "RuntimeBindingsV2",
+    "RuntimeCleanupReport",
     "SdkClockBinding",
     "SdkEnvironmentMapping",
     "SdkReadOnlyError",

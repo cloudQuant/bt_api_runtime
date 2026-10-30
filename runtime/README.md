@@ -136,6 +136,30 @@ run, and otherwise only calls Cerebro's thread-safe `runstop()`. The owner threa
 performs all cleanup. A live feed with no history and no polled bars does not
 exhaust by itself; callers must request a stop or wait for data.
 
+When startup, `run()`, or a `with` body already has a primary exception, a
+cleanup failure does not replace it. `RunSession.cleanup_report` (or the
+primary exception's `runtime_cleanup_report`) exposes only fixed cleanup step
+codes and confirmed/pending state, never exception text or configuration
+values. `complete` describes the latest cleanup outcome: it is false when that
+outcome has a failed step or unconfirmed state. A failed initial cleanup call
+may be followed by a confirmed owner-thread compensation retry, so the final
+report can be complete while the surfaced error still identifies that earlier
+cleanup failure. It is not remote provider/account proof. `GeneratorExit`,
+`KeyboardInterrupt`, and `SystemExit` from cleanup propagate when there is no
+earlier primary failure; otherwise the earlier failure remains authoritative.
+A partial `assemble_run`
+has no session object, so it attaches the report to the primary exception only
+when that exception exposes a writable instance dictionary with no conflicting
+`runtime_cleanup_report` attribute. If attachment is unsupported, the original
+exception is still preserved and no report is claimed to be observable. With
+an existing body exception, `__exit__` does not
+repeat cleanup already attempted by the session; an owner may explicitly retry
+`close()` afterward when the session remains open. A retry skips a Broker stop
+that this session previously observed returning successfully, while it retries
+an unconfirmed Store stop on the owner thread. If the Broker stop itself did not
+return, it remains retryable; a Store shutdown performed earlier by Cerebro but
+not observed in a session cleanup report is not treated as confirmed here.
+
 Backtrader does not enter its normal Strategy `_stop()` cleanup when a Strategy
 `_start()` fails before its main-loop `try` block. This candidate does not wrap
 or replace the registered Strategy class and therefore does not claim to clean

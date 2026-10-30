@@ -64,6 +64,119 @@ class RuntimeAssemblyError(RuntimeError):
         super().__init__(code)
 
 
+_CLEANUP_STEP_CODES = frozenset(
+    (
+        "broker_stop",
+        "component_inventory",
+        "component_state",
+        "component_stop",
+        "store_state",
+        "store_stop",
+        "store_stop_unconfirmed",
+        "metadata_probe_state",
+        "metadata_probe_shutdown",
+        "proxy_disconnect",
+        "proxy_state",
+        "cleanup_state_unknown",
+    )
+)
+
+
+@dataclass(frozen=True)
+class RuntimeCleanupReport:
+    """Finite cleanup observations without provider exception details."""
+
+    failed_steps: tuple[str, ...] = ()
+    pending_steps: tuple[str, ...] = ()
+    confirmed_steps: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for values in (self.failed_steps, self.pending_steps, self.confirmed_steps):
+            if type(values) is not tuple or any(
+                type(value) is not str or value not in _CLEANUP_STEP_CODES for value in values
+            ):
+                raise ValueError("cleanup report contains an unsupported step code")
+
+    @property
+    def complete(self) -> bool:
+        """Whether every required cleanup action returned and state was confirmed."""
+        return not self.failed_steps and not self.pending_steps
+
+
+@dataclass(frozen=True)
+class _CleanupOutcome:
+    report: RuntimeCleanupReport
+    interruption: BaseException | None = None
+
+
+def _cleanup_report(
+    *,
+    failed: list[str] | tuple[str, ...] = (),
+    pending: list[str] | tuple[str, ...] = (),
+    confirmed: list[str] | tuple[str, ...] = (),
+) -> RuntimeCleanupReport:
+    def unique(values):
+        return tuple(dict.fromkeys(values))
+
+    return RuntimeCleanupReport(unique(failed), unique(pending), unique(confirmed))
+
+
+def _attach_cleanup_report(
+    primary: BaseException,
+    report: RuntimeCleanupReport,
+    *,
+    replace: RuntimeCleanupReport | None = None,
+) -> bool:
+    """Best-effort attach a safe report without replacing the primary error.
+
+    Some exception objects have no writable instance dictionary. In that case
+    a caller outside a partially completed assembly cannot observe this report;
+    preserving the original exception takes precedence over wrapping it. A
+    prior report is replaced only when the caller supplies that exact report
+    as the expected value; unrelated attributes are preserved.
+    """
+    try:
+        namespace = BaseException.__getattribute__(primary, "__dict__")
+        if type(namespace) is not dict:
+            return False
+        if "runtime_cleanup_report" in namespace:
+            existing = namespace["runtime_cleanup_report"]
+            if existing is report:
+                return True
+            if replace is None or existing is not replace:
+                return False
+        dict.__setitem__(namespace, "runtime_cleanup_report", report)
+    except BaseException:  # noqa: BLE001 - diagnostics must never mask primary failure
+        return False
+    return True
+
+
+def _is_control_interrupt(error: BaseException) -> bool:
+    return isinstance(error, (GeneratorExit, KeyboardInterrupt, SystemExit))
+
+
+def _disconnect_proxy(proxy: ServiceReadProxy) -> _CleanupOutcome:
+    failed = []
+    pending = []
+    confirmed = []
+    interruption = None
+    try:
+        proxy.disconnect()
+    except BaseException as error:  # noqa: BLE001 - retain only finite cleanup state
+        failed.append("proxy_disconnect")
+        # ServiceReadProxy.is_connected is false while a failed disconnect is
+        # still in its closing state. A raised close therefore stays pending.
+        pending.append("proxy_disconnect")
+        if _is_control_interrupt(error):
+            interruption = error
+    else:
+        confirmed.append("proxy_disconnect")
+
+    return _CleanupOutcome(
+        _cleanup_report(failed=failed, pending=pending, confirmed=confirmed), interruption
+    )
+
+
 @dataclass(frozen=True)
 class FeedSpec:
     """One code-bound minute-bar feed declaration."""
@@ -407,6 +520,8 @@ class RunSession:
     __slots__ = (
         "_broker",
         "_cerebro",
+        "_cleanup_attempted",
+        "_cleanup_report",
         "_closed",
         "_environment",
         "_mode",
@@ -433,6 +548,8 @@ class RunSession:
         self._owner_thread_id = threading.get_ident()
         self._ran = False
         self._closed = False
+        self._cleanup_attempted = False
+        self._cleanup_report: RuntimeCleanupReport | None = None
 
     def _assert_owner_thread(self) -> None:
         if threading.get_ident() != self._owner_thread_id:
@@ -449,6 +566,11 @@ class RunSession:
     @property
     def environment(self):
         return self._environment
+
+    @property
+    def cleanup_report(self) -> RuntimeCleanupReport | None:
+        """Latest finite cleanup report, if this session attempted cleanup."""
+        return self._cleanup_report
 
     @property
     def is_running(self) -> bool:
@@ -492,66 +614,199 @@ class RunSession:
                 and worker is not threading.current_thread()
             )
 
-    def _compensate_failed_run(self) -> bool:
+    def _compensate_failed_run(self) -> _CleanupOutcome:
         """Best-effort unwind for exceptions before/inside engine cleanup.
 
         Each teardown layer is attempted even when an earlier layer fails.
         A successful Broker shutdown may stop the Store itself; Store state is
         checked before retrying it. The final direct proxy close is used only
         when no Store stop completed, including partial Store startup where the
-        proxy connected before Store flags were committed.
+        proxy connected before Store flags were committed. Exception details
+        are intentionally discarded; only fixed cleanup step codes are kept.
         """
-        cleanup_failed = False
+        failed = []
+        pending = []
+        confirmed = []
+        interruption = None
+
+        def capture_interrupt(error: BaseException) -> None:
+            nonlocal interruption
+            if interruption is None and _is_control_interrupt(error):
+                interruption = error
+
         store_stop_confirmed = False
+        store_state_known = True
+
+        previous_report = self._cleanup_report
+        if (
+            previous_report is not None
+            and "broker_stop" in previous_report.confirmed_steps
+        ):
+            # A prior owner-thread attempt completed the Broker's read-only
+            # shutdown method. Retry an unconfirmed Store stop below without
+            # rerunning its snapshot/summary path or asking it to stop Store
+            # again. A Broker stop that raised remains retryable.
+            confirmed.append("broker_stop")
+        else:
+            try:
+                self._broker.stop()
+            except BaseException as error:  # noqa: BLE001 - continue every cleanup layer
+                failed.append("broker_stop")
+                capture_interrupt(error)
+            else:
+                confirmed.append("broker_stop")
 
         try:
-            self._broker.stop()
-        except BaseException:  # noqa: BLE001 - continue every cleanup layer
-            cleanup_failed = True
-        if self._store._service_read_only_stopped:
-            # Store.stop sets this only after its injected proxy completed
-            # disconnect. The Broker's stop path may have performed that stop.
-            store_stop_confirmed = True
+            store_stop_confirmed = self._store._service_read_only_stopped is True
+        except BaseException as error:  # noqa: BLE001 - do not guess Store ownership state
+            failed.append("store_state")
+            pending.append("store_state")
+            store_state_known = False
+            capture_interrupt(error)
+        else:
+            if store_stop_confirmed:
+                confirmed.append("store_stop")
 
-        components = tuple(self._unique_components(self._cerebro.datas, self._cerebro.feeds))
+        try:
+            components = tuple(self._unique_components(self._cerebro.datas, self._cerebro.feeds))
+        except BaseException as error:  # noqa: BLE001 - continue Store/proxy cleanup
+            failed.append("component_inventory")
+            pending.append("component_inventory")
+            components = ()
+            capture_interrupt(error)
         for component in components:
             # Cerebro may already have completed its normal main-loop cleanup
             # before surfacing a later exception. BtApiFeed publishes this
             # lifecycle state; never stop an already-stopped feed a second time.
-            if not (
-                getattr(component, "_session_active", False)
-                or getattr(component, "_tick_consumer_claimed", False)
-            ):
+            try:
+                component_active = bool(
+                    getattr(component, "_session_active", False)
+                    or getattr(component, "_tick_consumer_claimed", False)
+                )
+            except BaseException as error:  # noqa: BLE001 - avoid an unproven duplicate stop
+                failed.append("component_state")
+                pending.append("component_state")
+                capture_interrupt(error)
+                continue
+            if not component_active:
                 continue
             try:
                 component.stop()
-            except BaseException:  # noqa: BLE001 - continue every cleanup layer
-                cleanup_failed = True
+            except BaseException as error:  # noqa: BLE001 - continue every cleanup layer
+                failed.append("component_stop")
+                pending.append("component_stop")
+                capture_interrupt(error)
+            else:
+                confirmed.append("component_stop")
 
         # A read-only connect may succeed before Store.start commits _started;
         # a later account read can reset _connected while leaving the proxy
         # connected. Stop once unless the actual Store already confirmed it.
-        if not self._store._service_read_only_stopped:
+        if store_state_known and not store_stop_confirmed:
             try:
                 self._store.stop()
-            except BaseException:  # noqa: BLE001 - proxy close is still attempted below
-                cleanup_failed = True
+            except BaseException as error:  # noqa: BLE001 - proxy close may still be attempted
+                failed.append("store_stop")
+                capture_interrupt(error)
+            try:
+                store_stop_confirmed = self._store._service_read_only_stopped is True
+            except BaseException as error:  # noqa: BLE001 - do not guess whether proxy is owned
+                failed.append("store_state")
+                pending.append("store_state")
+                store_state_known = False
+                capture_interrupt(error)
             else:
-                store_stop_confirmed = self._store._service_read_only_stopped
-                if not store_stop_confirmed:
-                    cleanup_failed = True
+                if store_stop_confirmed:
+                    confirmed.append("store_stop")
+                else:
+                    pending.append("store_stop_unconfirmed")
 
-        if not store_stop_confirmed:
-            if self._metadata_probe_shutdown_pending():
-                # BtApiStore refuses a concurrent disconnect while its metadata
-                # worker may still be reading this proxy. Preserve that custody.
-                cleanup_failed = True
+        if not store_state_known:
+            # The Store is the owner of the proxy boundary. If its stopped
+            # state cannot be read, bypassing it with a direct disconnect could
+            # race a Store-owned worker or repeat a close already in progress.
+            pending.append("proxy_disconnect")
+        elif not store_stop_confirmed:
+            try:
+                metadata_probe_pending = self._metadata_probe_shutdown_pending()
+            except BaseException as error:  # noqa: BLE001
+                failed.append("metadata_probe_state")
+                pending.append("metadata_probe_shutdown")
+                capture_interrupt(error)
             else:
-                try:
-                    self._proxy.disconnect()
-                except BaseException:  # noqa: BLE001 - failure remains retryable by owner
-                    cleanup_failed = True
-        return not cleanup_failed
+                if metadata_probe_pending:
+                    # BtApiStore refuses a concurrent disconnect while its metadata
+                    # worker may still be reading this proxy. Preserve that custody.
+                    pending.append("metadata_probe_shutdown")
+                else:
+                    outcome = _disconnect_proxy(self._proxy)
+                    failed.extend(outcome.report.failed_steps)
+                    pending.extend(outcome.report.pending_steps)
+                    confirmed.extend(outcome.report.confirmed_steps)
+                    if interruption is None:
+                        interruption = outcome.interruption
+
+        report = _cleanup_report(failed=failed, pending=pending, confirmed=confirmed)
+        return _CleanupOutcome(report, interruption)
+
+    def _record_cleanup_outcome(self, outcome: _CleanupOutcome) -> None:
+        self._cleanup_report = outcome.report
+        self._cleanup_attempted = True
+
+    def _safe_compensate_failed_run(self) -> _CleanupOutcome:
+        """Reduce unexpected compensation failures to finite, unconfirmed state."""
+        try:
+            return self._compensate_failed_run()
+        except BaseException as error:  # noqa: BLE001 - never leak secondary cleanup details
+            report = _cleanup_report(
+                failed=("cleanup_state_unknown",), pending=("cleanup_state_unknown",)
+            )
+            interruption = error if _is_control_interrupt(error) else None
+            return _CleanupOutcome(report, interruption)
+
+    def _mark_closed_after_cleanup(
+        self,
+        outcome: _CleanupOutcome,
+        *,
+        primary: BaseException | None = None,
+        error_code: str = "run_cleanup_failed",
+    ) -> None:
+        """Mark closure without allowing an unexpected failure to mask primary state."""
+        try:
+            self._mark_closed()
+        except BaseException as error:
+            report = _cleanup_report(
+                failed=outcome.report.failed_steps + ("cleanup_state_unknown",),
+                pending=outcome.report.pending_steps + ("cleanup_state_unknown",),
+                confirmed=outcome.report.confirmed_steps,
+            )
+            self._record_cleanup_outcome(_CleanupOutcome(report))
+            if primary is not None:
+                _attach_cleanup_report(primary, report, replace=outcome.report)
+                return
+            _attach_cleanup_report(error, report)
+            if _is_control_interrupt(error):
+                raise
+            sanitized = RuntimeAssemblyError(error_code)
+            _attach_cleanup_report(sanitized, report)
+            raise sanitized from None
+
+    def _cleanup_preserving_primary(self, primary: BaseException) -> None:
+        """Attempt owner-thread cleanup without replacing an active failure."""
+        try:
+            outcome = (
+                self._safe_compensate_failed_run() if self._ran else _disconnect_proxy(self._proxy)
+            )
+        except BaseException:  # noqa: BLE001 - fallback must not mask the primary failure
+            outcome = _CleanupOutcome(
+                _cleanup_report(
+                    failed=("cleanup_state_unknown",), pending=("cleanup_state_unknown",)
+                )
+            )
+        self._record_cleanup_outcome(outcome)
+        _attach_cleanup_report(primary, outcome.report)
+        if outcome.report.complete:
+            self._mark_closed_after_cleanup(outcome, primary=primary)
 
     def run(self) -> list[Strategy]:
         self._assert_owner_thread()
@@ -560,36 +815,101 @@ class RunSession:
         if self._ran:
             raise RuntimeAssemblyError("session_already_run")
         if not self._cerebro.datas:
-            self.close()
-            raise RuntimeAssemblyError("session_has_no_feeds")
+            primary = RuntimeAssemblyError("session_has_no_feeds")
+            self._cleanup_preserving_primary(primary)
+            raise primary
         self._ran = True
         try:
             strategies = self._cerebro.run()
-        except BaseException:
-            if not self._compensate_failed_run():
-                raise RuntimeAssemblyError("run_cleanup_failed") from None
-            self._mark_closed()
+        except BaseException as primary:
+            self._cleanup_preserving_primary(primary)
             raise
 
         # Cerebro normally stopped the Store in its own run lifecycle. It
         # ignores the Store's shutdown report, so do not bypass an unresolved
         # metadata worker with a direct proxy close. Leave the session open for
         # an owner-thread close retry after that worker completes.
-        if not self._store._service_read_only_stopped:
-            if self._metadata_probe_shutdown_pending():
-                raise RuntimeAssemblyError("provider_cleanup_incomplete")
+        try:
+            store_stopped = self._store._service_read_only_stopped is True
+        except BaseException as error:
+            report = _cleanup_report(failed=("store_state",), pending=("store_state",))
+            self._record_cleanup_outcome(_CleanupOutcome(report))
+            _attach_cleanup_report(error, report)
+            if _is_control_interrupt(error):
+                raise
+            raise RuntimeAssemblyError("provider_cleanup_incomplete") from None
+        if not store_stopped:
+            try:
+                metadata_probe_pending = self._metadata_probe_shutdown_pending()
+            except BaseException as error:
+                report = _cleanup_report(
+                    failed=("metadata_probe_state",), pending=("metadata_probe_shutdown",)
+                )
+                self._record_cleanup_outcome(_CleanupOutcome(report))
+                _attach_cleanup_report(error, report)
+                if _is_control_interrupt(error):
+                    raise
+                raise RuntimeAssemblyError("provider_cleanup_incomplete") from None
+            if metadata_probe_pending:
+                report = _cleanup_report(pending=("metadata_probe_shutdown",))
+                self._record_cleanup_outcome(_CleanupOutcome(report))
+                error = RuntimeAssemblyError("provider_cleanup_incomplete")
+                _attach_cleanup_report(error, report)
+                raise error
             try:
                 self._store.stop()
-            except BaseException:  # noqa: BLE001 - retry only through the Store-aware path
-                if not self._compensate_failed_run():
-                    raise RuntimeAssemblyError("run_cleanup_failed") from None
-                self._mark_closed()
-                raise RuntimeAssemblyError("provider_cleanup_failed") from None
-            if not self._store._service_read_only_stopped:
-                raise RuntimeAssemblyError("provider_cleanup_incomplete")
-        if self._proxy.is_connected:
-            raise RuntimeAssemblyError("provider_cleanup_incomplete")
-        self._mark_closed()
+            except BaseException as cleanup_error:
+                outcome = self._safe_compensate_failed_run()
+                self._record_cleanup_outcome(outcome)
+                _attach_cleanup_report(cleanup_error, outcome.report)
+                if outcome.report.complete:
+                    self._mark_closed_after_cleanup(outcome, primary=cleanup_error)
+                if _is_control_interrupt(cleanup_error):
+                    raise
+                # The Store-stop exception is already the primary failure;
+                # a control exception during compensation must not replace it.
+                report = self._cleanup_report or outcome.report
+                code = (
+                    "provider_cleanup_failed" if report.complete else "run_cleanup_failed"
+                )
+                error = RuntimeAssemblyError(code)
+                _attach_cleanup_report(error, report)
+                raise error from None
+            try:
+                store_stopped = self._store._service_read_only_stopped is True
+            except BaseException as error:
+                report = _cleanup_report(failed=("store_state",), pending=("store_state",))
+                self._record_cleanup_outcome(_CleanupOutcome(report))
+                _attach_cleanup_report(error, report)
+                if _is_control_interrupt(error):
+                    raise
+                raise RuntimeAssemblyError("provider_cleanup_incomplete") from None
+            if not store_stopped:
+                report = _cleanup_report(pending=("store_stop_unconfirmed",))
+                self._record_cleanup_outcome(_CleanupOutcome(report))
+                error = RuntimeAssemblyError("provider_cleanup_incomplete")
+                _attach_cleanup_report(error, report)
+                raise error
+        try:
+            proxy_connected = self._proxy.is_connected
+        except BaseException as error:
+            report = _cleanup_report(failed=("proxy_state",), pending=("proxy_state",))
+            self._record_cleanup_outcome(_CleanupOutcome(report))
+            _attach_cleanup_report(error, report)
+            if _is_control_interrupt(error):
+                raise
+            raise RuntimeAssemblyError("provider_cleanup_incomplete") from None
+        if proxy_connected is not False:
+            report = _cleanup_report(pending=("proxy_disconnect",))
+            self._record_cleanup_outcome(_CleanupOutcome(report))
+            error = RuntimeAssemblyError("provider_cleanup_incomplete")
+            _attach_cleanup_report(error, report)
+            raise error
+        outcome = _CleanupOutcome(
+            _cleanup_report(confirmed=("store_stop", "proxy_disconnect"))
+        )
+        self._record_cleanup_outcome(outcome)
+        self._mark_closed_after_cleanup(outcome)
         return strategies
 
     def close(self) -> None:
@@ -597,15 +917,32 @@ class RunSession:
         if self._closed:
             return
         if self._ran:
-            if not self._compensate_failed_run():
-                raise RuntimeAssemblyError("run_cleanup_failed") from None
-            self._mark_closed()
+            outcome = self._safe_compensate_failed_run()
+            self._record_cleanup_outcome(outcome)
+            if outcome.report.complete:
+                self._mark_closed_after_cleanup(
+                    outcome, error_code="run_cleanup_failed"
+                )
+                return
+            if outcome.interruption is not None:
+                _attach_cleanup_report(outcome.interruption, outcome.report)
+                raise outcome.interruption
+            error = RuntimeAssemblyError("run_cleanup_failed")
+            _attach_cleanup_report(error, outcome.report)
+            raise error from None
+        outcome = _disconnect_proxy(self._proxy)
+        self._record_cleanup_outcome(outcome)
+        if outcome.report.complete:
+            self._mark_closed_after_cleanup(
+                outcome, error_code="provider_cleanup_failed"
+            )
             return
-        try:
-            self._proxy.disconnect()
-        except BaseException:  # noqa: BLE001 - preserve only a finite boundary code
-            raise RuntimeAssemblyError("provider_cleanup_failed") from None
-        self._mark_closed()
+        if outcome.interruption is not None:
+            _attach_cleanup_report(outcome.interruption, outcome.report)
+            raise outcome.interruption
+        error = RuntimeAssemblyError("provider_cleanup_failed")
+        _attach_cleanup_report(error, outcome.report)
+        raise error from None
 
     def __enter__(self):
         self._assert_owner_thread()
@@ -614,9 +951,25 @@ class RunSession:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
-        self._assert_owner_thread()
+        try:
+            self._assert_owner_thread()
+        except BaseException:
+            if exc_value is None:
+                raise
+            report = _cleanup_report(pending=("cleanup_state_unknown",))
+            self._record_cleanup_outcome(_CleanupOutcome(report))
+            _attach_cleanup_report(exc_value, report)
+            return False
         if not self._closed:
-            self.close()
+            if exc_value is None:
+                self.close()
+            elif self._cleanup_attempted:
+                # run() may already have tried cleanup before its exception
+                # reached the context manager. Do not repeat shutdown calls.
+                if self._cleanup_report is not None:
+                    _attach_cleanup_report(exc_value, self._cleanup_report)
+            else:
+                self._cleanup_preserving_primary(exc_value)
         return False
 
 
@@ -736,11 +1089,9 @@ def assemble_run(
             cerebro.adddata(feed, name=spec.dataname)
         cerebro.setbroker(broker)
         return RunSession(cerebro, store, broker, proxy, config)
-    except BaseException:
-        try:
-            proxy.disconnect()
-        except BaseException:  # noqa: BLE001 - avoid exposing facade exception details
-            raise RuntimeAssemblyError("provider_cleanup_failed") from None
+    except BaseException as primary:
+        outcome = _disconnect_proxy(proxy)
+        _attach_cleanup_report(primary, outcome.report)
         raise
 
 
@@ -752,5 +1103,6 @@ __all__ = [
     "RuntimeAssemblyError",
     "RuntimeBindings",
     "RuntimeBindingsV2",
+    "RuntimeCleanupReport",
     "assemble_run",
 ]
