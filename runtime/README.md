@@ -27,7 +27,7 @@ references, static capability declaration, and strategy-parameter contract to
 one code-owned strategy class, feed set, and provider factory before invoking
 that factory.
 
-The current source candidate is version 0.1.9. It includes an optional
+The current source candidate is version 0.1.10. It includes an optional
 lazy-imported SDK read-only facade factory and resource owner; the Python 3.11+
 SDK remains absent from the runtime's required dependencies so ordinary
 package imports continue to support Python 3.9+.
@@ -42,12 +42,19 @@ strategy parameters; it cannot import strategy or provider modules or supply
 feed configuration. V2 requires an explicit request for both `market.read` and
 `account.read`; write requests and enabled plugins fail before the provider
 factory runs. Every V2 provider factory must expose a callable
-`preflight(selected_route)` hook that returns the singleton `True`; a missing
-or non-callable hook, a non-`True` result, or an ordinary lookup/call exception
-fails closed before the provider factory is invoked. V1 retains its prior
-zero-argument factory behavior, including support for factories without a
-preflight hook. V2 parameters are copied to ordinary Python values and passed
-as Strategy keyword arguments. There is no default SDK provider factory in
+`preflight(selected_route, *, run_id)` hook that returns the singleton `True`;
+`assemble_run(source, bindings, run_id=...)` requires the caller to supply a
+run identity for V2. The accepted syntax is 1–128 ASCII characters matching
+`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. Missing or malformed values fail before
+factory preflight. An empty value is rejected before the SDK runtime constructor,
+so this integration does not rely on the SDK's empty-value UUID fallback. V1
+keeps its previous call shape and has no run identity.
+A missing or non-callable hook, a non-`True` result, or an ordinary lookup/call
+exception fails closed before the provider factory is invoked. V1 retains its
+prior zero-argument factory behavior, including support for factories without
+a preflight hook. V2 parameters are copied to ordinary Python values and passed
+as Strategy keyword arguments. `RunSession.run_id` exposes the same explicit
+V2 identifier. There is no default SDK provider factory in
 this package. Runtime assembly requires a
 Backtrader build that exposes the public `ServiceReadProxy.supports_bar_history`
 capability API (available in source commit `0f88508d3`). The upstream distribution
@@ -132,7 +139,13 @@ request/reply transport and event subscriber leaves are injectable, so source
 tests can use deterministic fakes without replacing the runtime or facades.
 SDK imports remain lazy: importing `bt_api_runtime` and using ordinary runtime
 assembly do not load `bt_api_py`. The SDK-backed factory loads SDK modules in
-`preflight()`; a direct `build()` performs that preflight first when needed.
+`preflight(selected_route, *, run_id)`; a direct `build(run_id=...)` performs
+that preflight first when needed. A prior explicit preflight also binds the
+run ID used by a subsequent zero-argument factory call. The factory passes the
+bound value to `ServiceClientRuntime(run_id=...)`, then checks the actual
+runtime ID and both immutable account/market registration scopes and operation
+sets using the SDK's public binding views. It separately checks that the
+public stream scope still has no run ID.
 This keeps the Python 3.11+ SDK optional for ordinary Python 3.9+ runtime
 imports and v1 assembly.
 
@@ -149,14 +162,15 @@ a later retry is not promised to repair it. The SDK has no general standalone
 close-receipt DTO, so these observations are derived from normal facade/runtime
 returns and the SDK's public uncertainty counters, not independent remote proof.
 
-The SDK factory exposes the required public `preflight(selected_route)` hook,
-which `assemble_run` calls after selecting the code-owned route and before
-calling the factory. V2 factories without a callable hook, or whose hook does
-not return exactly `True`, fail closed before provider construction. V1 keeps
-its prior optional-hook behavior. Preflight checks selected-route/config
-consistency only; it is not an identity authority or authorization service. A
-trusted registry or deployment authority is still needed for formal
-provider/account identity and permission decisions.
+The SDK factory exposes the required public
+`preflight(selected_route, *, run_id)` hook, which `assemble_run` calls after
+selecting the code-owned route and before calling the factory. V2 factories
+without a callable hook, or whose hook does not return exactly `True`, fail
+closed before provider construction. V1 keeps its prior optional-hook
+behavior. Preflight binds local composition inputs only. A matching string or
+UUID does not establish uniqueness, endpoint identity, authorization, source
+truth, or account acceptance; a trusted registry or deployment authority is
+still needed for provider/account identity and permission decisions.
 
 The session is bound to the thread that assembled it. `run()` and `close()`
 must use that owner thread because the proxy is thread-bound. Any thread may

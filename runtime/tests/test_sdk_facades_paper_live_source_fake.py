@@ -401,6 +401,7 @@ class _LocalRequestReplyTransport:
         peer: WireIdentity,
         *,
         drop_unregister_response: bool = False,
+        drop_register_response: bool = False,
     ):
         self.registry = registry
         self.principal_ref = principal_ref
@@ -408,6 +409,7 @@ class _LocalRequestReplyTransport:
         self.operations: list[str] = []
         self.closed = False
         self.drop_unregister_response = drop_unregister_response
+        self.drop_register_response = drop_register_response
 
     def request(self, request: WireEnvelope, *, timeout: float) -> WireEnvelope:
         if self.closed:
@@ -416,6 +418,9 @@ class _LocalRequestReplyTransport:
             raise AssertionError("RPC timeout was not explicitly bounded")
         self.operations.append(request.header.operation)
         result = self.registry.handle(self.principal_ref, request)
+        if request.header.operation == "service.register" and self.drop_register_response:
+            self.drop_register_response = False
+            raise OSError("synthetic register response loss")
         if (
             request.header.operation == "service.unregister"
             and self.drop_unregister_response
@@ -512,6 +517,7 @@ def _make_stack(
     *,
     subscriber_close_failures: int = 0,
     drop_unregister_response: bool = False,
+    drop_register_response: bool = False,
     source_identity_overrides=(),
     history_bar_count: int = 1,
     history_end_utc: str | None = None,
@@ -636,6 +642,7 @@ def _make_stack(
         client.principal_ref,
         peer,
         drop_unregister_response=drop_unregister_response,
+        drop_register_response=drop_register_response,
     )
     raw_config = {
         "client_config_schema_version": 1,
@@ -829,9 +836,9 @@ def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(
     original_preflight = SdkReadOnlyFacadeFactory.preflight
     original_call = SdkReadOnlyFacadeFactory.__call__
 
-    def observed_preflight(factory, selected_route):
-        result = original_preflight(factory, selected_route)
-        preflight_routes.append((id(factory), selected_route))
+    def observed_preflight(factory, selected_route, *, run_id):
+        result = original_preflight(factory, selected_route, run_id=run_id)
+        preflight_routes.append((id(factory), selected_route, run_id))
         if result is True:
             factory_ids_after_preflight.add(id(factory))
         return result
@@ -844,13 +851,18 @@ def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(
     monkeypatch.setattr(SdkReadOnlyFacadeFactory, "__call__", observed_call)
 
     for environment in (Environment.PAPER, Environment.LIVE):
+        run_id = f"sourcefake-run-{environment.value}"
         session = None
         normal_proxy_close_confirmed = False
         stop_requested = threading.Event()
         timer = None
         try:
             try:
-                session = assemble_run(_run_config(routes[environment]), bindings)
+                session = assemble_run(
+                    _run_config(routes[environment]),
+                    bindings,
+                    run_id=run_id,
+                )
             except RuntimeAssemblyError as error:
                 diagnostic = _SETUP_DIAGNOSTICS.get(environment)
                 if error.code == "provider_factory_failed" and diagnostic is not None:
@@ -863,9 +875,10 @@ def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(
 
             stack = stacks[environment]
             factory_id = id(stack["factory"])
-            assert preflight_routes[-1] == (factory_id, routes[environment])
+            assert preflight_routes[-1] == (factory_id, routes[environment], run_id)
             assert preflight_before_factory[-1] is True
             assert sum(item[0] == factory_id for item in preflight_routes) == 1
+            assert session.run_id == run_id
 
             def request_stop_at_deadline(
                 stop_requested=stop_requested,
@@ -889,6 +902,32 @@ def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(
             assert type(owner.account_client) is ServiceAccountClient
             assert type(owner.market_client) is ServiceMarketClient
             assert type(owner.proxy) is ServiceReadProxy
+            assert owner.runtime.run_id == run_id
+            account_view = owner.runtime.account_binding_view(
+                "store.account",
+                stack["spec"].account_ref,
+                required_operations=_SERVICE_ACCOUNT_OPERATIONS,
+            )
+            market_view = owner.runtime.market_binding_view(
+                "store.market",
+                required_operations=_SERVICE_MARKET_OPERATIONS,
+            )
+            expected_account_scope = replace(
+                stack["spec"].account_scope,
+                strategy_ref=stack["spec"].identity.actor_ref,
+                run_id=run_id,
+            )
+            expected_market_scope = replace(
+                stack["spec"].market_scope,
+                strategy_ref=stack["spec"].identity.actor_ref,
+                run_id=run_id,
+            )
+            assert account_view.rpc_scope == expected_account_scope
+            assert market_view.rpc_scope == expected_market_scope
+            assert account_view.operations == _SERVICE_ACCOUNT_OPERATIONS
+            assert market_view.operations == _SERVICE_MARKET_OPERATIONS
+            assert owner.market_client.stream_scope.run_id is None
+            assert owner.market_client.stream_scope.strategy_ref is None
             assert type(strategy) is _SameStrategy
             assert type(strategy.env) is Cerebro
             assert type(strategy.datas[0]) is BtApiFeed
@@ -912,6 +951,10 @@ def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(
             assert owner.proxy.is_connected is False
             assert stack["service"].market_registrations == set()
             assert stack["subscriber"].closed is True
+            assert all(
+                scope.run_id is None and scope.strategy_ref is None
+                for _binding, scope in stack["subscriber_factory_calls"]
+            )
             assert stack["transport"].closed is False
             assert owner.runtime.state == "registered"
             assert "account.snapshot" in stack["service"].operations
@@ -970,13 +1013,252 @@ def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(
             stack["registry"].set_ready(True)
 
 
+@pytest.mark.parametrize("run_id", ("", " leading", "bad/path", "é-run", "x" * 129))
+def test_sdk_factory_rejects_malformed_run_id_before_runtime_or_transport(tmp_path, run_id):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+
+    with pytest.raises(SdkReadOnlyError) as error:
+        stack["factory"].preflight(stack["spec"].route, run_id=run_id)
+
+    assert error.value.code == "sdk_run_identity_invalid"
+    assert str(error.value) == "sdk_run_identity_invalid"
+    assert stack["owner"].runtime is None
+    assert stack["transport_factory_calls"] == []
+    assert stack["transport"].operations == []
+    stack["registry"].close()
+
+
+def test_sdk_factory_requires_explicit_runtime_run_id_keyword_before_io(monkeypatch, tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+
+    def legacy_runtime_init(
+        runtime,
+        config,
+        *,
+        identity,
+        scope_resolver,
+        peer_resolver,
+        transport_factory,
+        client_session_id=None,
+        requested_operations=None,
+        monotonic_clock=None,
+    ):
+        raise AssertionError("legacy runtime constructor must not be called")
+
+    monkeypatch.setattr(ServiceClientRuntime, "__init__", legacy_runtime_init)
+    with pytest.raises(SdkReadOnlyError) as error:
+        stack["factory"].preflight(stack["spec"].route, run_id="selected-run")
+
+    assert error.value.code == "sdk_runtime_run_identity_unsupported"
+    assert stack["owner"].runtime is None
+    assert stack["transport_factory_calls"] == []
+    assert stack["transport"].operations == []
+    stack["registry"].close()
+
+
+@pytest.mark.parametrize(
+    "signature_case",
+    (
+        "account_arguments_keyword_only",
+        "market_mount_keyword_only",
+        "account_arguments_reordered",
+        "required_operations_positional_only",
+    ),
+)
+def test_sdk_factory_rejects_incompatible_binding_view_call_signature_before_io(
+    monkeypatch, tmp_path, signature_case
+):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+
+    if signature_case == "account_arguments_keyword_only":
+
+        def incompatible_view(runtime, *, mount, account_ref, required_operations):
+            raise AssertionError("preflight must inspect without calling the view")
+
+        monkeypatch.setattr(ServiceClientRuntime, "account_binding_view", incompatible_view)
+    elif signature_case == "market_mount_keyword_only":
+
+        def incompatible_view(runtime, *, mount, required_operations):
+            raise AssertionError("preflight must inspect without calling the view")
+
+        monkeypatch.setattr(ServiceClientRuntime, "market_binding_view", incompatible_view)
+    elif signature_case == "account_arguments_reordered":
+
+        def incompatible_view(runtime, account_ref, mount, *, required_operations):
+            raise AssertionError("preflight must inspect without calling the view")
+
+        monkeypatch.setattr(ServiceClientRuntime, "account_binding_view", incompatible_view)
+    else:
+
+        def incompatible_view(runtime, mount, account_ref, required_operations, /):
+            raise AssertionError("preflight must inspect without calling the view")
+
+        monkeypatch.setattr(ServiceClientRuntime, "account_binding_view", incompatible_view)
+
+    with pytest.raises(SdkReadOnlyError) as error:
+        stack["factory"].preflight(stack["spec"].route, run_id="selected-run")
+
+    assert error.value.code == "sdk_registered_binding_views_unsupported"
+    assert error.value.__context__ is None
+    assert stack["owner"].runtime is None
+    assert stack["transport_factory_calls"] == []
+    assert stack["transport"].operations == []
+    assert stack["subscriber_factory_calls"] == []
+    assert stack["subscriber"].close_calls == 0
+    stack["registry"].close()
+
+
+def test_sdk_factory_requires_identity_and_refuses_cross_run_rebinding_before_io(tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    with pytest.raises(SdkReadOnlyError) as missing:
+        stack["factory"].build()
+
+    assert missing.value.code == "sdk_run_identity_required"
+    assert stack["owner"].runtime is None
+    assert stack["transport_factory_calls"] == []
+
+    assert stack["factory"].preflight(
+        stack["spec"].route,
+        run_id="first-run",
+    ) is True
+    route = stack["spec"].route
+    bindings = RuntimeBindingsV2(
+        TrustedRegistryV2((route,)),
+        (RouteBindingV2(route, _SameStrategy, (FeedSpec(_DATA_NAME),), stack["factory"]),),
+    )
+
+    with pytest.raises(RuntimeAssemblyError) as mismatch:
+        assemble_run(_run_config(route), bindings, run_id="second-run")
+
+    assert mismatch.value.code == "provider_binding_preflight_failed"
+    assert mismatch.value.__context__ is None
+    assert stack["owner"].runtime is None
+    assert stack["transport_factory_calls"] == []
+    assert stack["transport"].operations == []
+    stack["registry"].close()
+
+
+def test_sdk_factory_rejects_runtime_run_id_mismatch_before_transport(monkeypatch, tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    original_init = ServiceClientRuntime.__init__
+
+    def mismatched_init(
+        runtime,
+        config,
+        *,
+        identity,
+        scope_resolver,
+        peer_resolver,
+        transport_factory,
+        client_session_id=None,
+        run_id=None,
+        requested_operations=None,
+        monotonic_clock=time.monotonic,
+    ):
+        original_init(
+            runtime,
+            config,
+            identity=identity,
+            scope_resolver=scope_resolver,
+            peer_resolver=peer_resolver,
+            transport_factory=transport_factory,
+            client_session_id=client_session_id,
+            run_id=run_id,
+            requested_operations=requested_operations,
+            monotonic_clock=monotonic_clock,
+        )
+        runtime.run_id = "different-run"
+
+    monkeypatch.setattr(ServiceClientRuntime, "__init__", mismatched_init)
+
+    with pytest.raises(SdkReadOnlyError) as error:
+        stack["factory"].build(run_id="selected-run")
+
+    assert error.value.code == "sdk_runtime_run_id_mismatch"
+    assert stack["owner"].runtime is not None
+    assert stack["owner"].state == "closed"
+    assert stack["owner"].runtime.unknown_registration_count == 0
+    assert stack["transport_factory_calls"] == []
+    assert stack["transport"].operations == []
+    stack["registry"].close()
+
+
+@pytest.mark.parametrize("mismatch", ("account_run_id", "market_operations"))
+def test_registered_binding_mismatch_retains_uncertain_owner_and_registration(
+    monkeypatch, tmp_path, mismatch
+):
+    stack = _make_stack(
+        Environment.PAPER,
+        tmp_path,
+        drop_unregister_response=True,
+    )
+    if mismatch == "account_run_id":
+        original_view = ServiceClientRuntime.account_binding_view
+
+        def mismatched_view(runtime, mount, account_ref, *, required_operations):
+            view = original_view(
+                runtime,
+                mount,
+                account_ref,
+                required_operations=required_operations,
+            )
+            return replace(
+                view,
+                rpc_scope=replace(view.rpc_scope, run_id="different-run"),
+            )
+
+        monkeypatch.setattr(ServiceClientRuntime, "account_binding_view", mismatched_view)
+        expected_code = "sdk_registered_binding_view_mismatch"
+    else:
+        original_view = ServiceClientRuntime.market_binding_view
+
+        def mismatched_view(runtime, mount, *, required_operations):
+            view = original_view(
+                runtime,
+                mount,
+                required_operations=required_operations,
+            )
+            return replace(view, operations=frozenset({"market.subscribe"}))
+
+        monkeypatch.setattr(ServiceClientRuntime, "market_binding_view", mismatched_view)
+        expected_code = "sdk_registered_binding_view_mismatch"
+
+    with pytest.raises(SdkReadOnlyError) as error:
+        stack["factory"].build(run_id="selected-run")
+
+    owner = stack["owner"]
+    assert error.value.code == expected_code
+    assert owner.retained is True
+    assert owner.state == "remote_uncertain"
+    assert owner.runtime.unregister_uncertainties > 0
+    assert owner.runtime.unknown_registration_count == 0
+    assert stack["transport"].operations.count("service.register") == 2
+    stack["registry"].close()
+
+
+def test_lost_register_response_keeps_unknown_registration_and_owner_resources(tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path, drop_register_response=True)
+
+    with pytest.raises(SdkReadOnlyError) as error:
+        stack["factory"].build(run_id="selected-run")
+
+    owner = stack["owner"]
+    assert error.value.code == "sdk_facade_construction_failed"
+    assert owner.retained is True
+    assert owner.state == "remote_uncertain"
+    assert owner.runtime.unknown_registration_count == 1
+    assert owner.runtime.unregister_uncertainties == 0
+    assert stack["transport"].operations.count("service.register") == 1
+    stack["registry"].close()
+
+
 def test_failed_proxy_close_is_retained_until_owner_retry(tmp_path):
     stack = _make_stack(
         Environment.PAPER,
         tmp_path,
         subscriber_close_failures=1,
     )
-    owner = stack["factory"].build()
+    owner = stack["factory"].build(run_id="sourcefake-run")
     owner.market_client.start()
     assert stack["service"].market_registrations
 
@@ -1008,7 +1290,9 @@ def test_failed_proxy_close_is_retained_until_owner_retry(tmp_path):
 
 def test_factory_requires_sdk_market_source_descriptor(tmp_path):
     stack = _make_stack(Environment.PAPER, tmp_path)
-    assert stack["factory"].preflight(stack["spec"].route) is True
+    assert stack["factory"].preflight(
+        stack["spec"].route, run_id="sourcefake-run"
+    ) is True
     owner = stack["factory"].build()
     try:
         owner.market_client.start()
@@ -1053,7 +1337,7 @@ def test_source_expectation_must_be_explicit_and_valid_before_io(tmp_path, inval
     )
 
     with pytest.raises(SdkReadOnlyError) as error:
-        factory.build()
+        factory.build(run_id="sourcefake-run")
 
     assert error.value.code == "invalid_sdk_market_source_expectation"
     assert error.value.__context__ is None
@@ -1083,6 +1367,7 @@ def test_each_source_identity_mismatch_blocks_first_bar_and_history(tmp_path, fi
     session = assemble_run(
         _run_config(stack["spec"].route),
         _single_stack_bindings(stack, NoBarStrategy),
+        run_id="sourcefake-run",
     )
     try:
         with pytest.raises(ServiceMarketError) as run_error:
@@ -1133,6 +1418,7 @@ def test_source_mismatch_cleanup_uncertainty_retains_owner_resources(tmp_path):
     session = assemble_run(
         _run_config(stack["spec"].route),
         _single_stack_bindings(stack, NoBarStrategy),
+        run_id="sourcefake-run",
     )
     try:
         with pytest.raises(ServiceMarketError) as run_error:
@@ -1192,6 +1478,7 @@ def test_recovery_source_mismatch_cannot_deliver_another_strategy_bar(tmp_path):
     session = assemble_run(
         _run_config(stack["spec"].route),
         _single_stack_bindings(stack, RecoverOnFirstBarStrategy),
+        run_id="sourcefake-run",
     )
     market_client = stack["owner"].market_client
     try:
@@ -1229,7 +1516,7 @@ def test_recovery_source_mismatch_cannot_deliver_another_strategy_bar(tmp_path):
 
 def test_expected_source_identity_batch_start_does_not_fallback_to_singleton(tmp_path):
     stack = _make_stack(Environment.PAPER, tmp_path)
-    owner = stack["factory"].build()
+    owner = stack["factory"].build(run_id="sourcefake-run")
     try:
         with pytest.raises(ServiceMarketError) as error:
             ServiceMarketClient.start_many((owner.market_client,))
@@ -1264,7 +1551,7 @@ def test_route_mapping_mismatch_is_rejected_before_transport_factory_or_start(tm
     factory = SdkReadOnlyFacadeFactory(bad_spec)
 
     with pytest.raises(SdkReadOnlyError) as error:
-        factory.build()
+        factory.build(run_id="sourcefake-run")
 
     assert error.value.code == "route_reference_mapping_mismatch"
     assert error.value.__context__ is None
@@ -1283,7 +1570,7 @@ def test_environment_mapping_mismatch_is_rejected_before_transport_factory(tmp_p
     factory = SdkReadOnlyFacadeFactory(bad_spec)
 
     with pytest.raises(SdkReadOnlyError) as error:
-        factory.build()
+        factory.build(run_id="sourcefake-run")
 
     assert error.value.code == "sdk_route_binding_mismatch"
     assert error.value.__context__ is None
@@ -1303,7 +1590,7 @@ def test_clock_reference_and_callable_mismatch_is_rejected_before_io(tmp_path):
     factory = SdkReadOnlyFacadeFactory(bad_spec)
 
     with pytest.raises(SdkReadOnlyError) as error:
-        factory.build()
+        factory.build(run_id="sourcefake-run")
 
     assert error.value.code == "sdk_route_binding_mismatch"
     assert error.value.__context__ is None
@@ -1323,7 +1610,7 @@ def test_scope_with_unmapped_run_dimension_is_rejected_before_io(tmp_path):
     factory = SdkReadOnlyFacadeFactory(bad_spec)
 
     with pytest.raises(SdkReadOnlyError) as error:
-        factory.build()
+        factory.build(run_id="sourcefake-run")
 
     assert error.value.code == "sdk_scope_or_market_mapping_mismatch"
     assert error.value.__context__ is None
@@ -1349,7 +1636,7 @@ def test_assemble_run_preflights_factory_against_selected_route(tmp_path):
     )
 
     with pytest.raises(RuntimeAssemblyError) as error:
-        assemble_run(_run_config(selected_route), bindings)
+        assemble_run(_run_config(selected_route), bindings, run_id="sourcefake-run")
 
     assert error.value.code == "provider_binding_preflight_failed"
     assert error.value.__context__ is None
@@ -1386,8 +1673,9 @@ def test_assemble_run_propagates_preflight_process_control_signals(
     else:
 
         class InterruptingCallFactory(FactoryWithoutInterruptingHook):
-            def preflight(self, selected_route):
+            def preflight(self, selected_route, *, run_id):
                 assert selected_route == route
+                assert run_id == "sourcefake-run"
                 raise marker
 
         factory = InterruptingCallFactory()
@@ -1398,7 +1686,7 @@ def test_assemble_run_propagates_preflight_process_control_signals(
     )
 
     with pytest.raises(interrupt_type) as error:
-        assemble_run(_run_config(route), bindings)
+        assemble_run(_run_config(route), bindings, run_id="sourcefake-run")
 
     assert error.value is marker
     assert error.value.__context__ is None
@@ -1416,7 +1704,7 @@ def test_sdk_factory_cleans_then_propagates_transport_keyboard_interrupt(tmp_pat
     factory = SdkReadOnlyFacadeFactory(spec)
 
     with pytest.raises(KeyboardInterrupt) as error:
-        factory.build()
+        factory.build(run_id="sourcefake-run")
 
     assert error.value is marker
     assert error.value.__context__ is None
@@ -1476,7 +1764,9 @@ def test_sdk_import_boundary_suppresses_ambient_exception(monkeypatch, tmp_path)
         raise RuntimeError("ambient-private-token")
     except RuntimeError:
         with pytest.raises(SdkReadOnlyError) as error:
-            stack["factory"].preflight(stack["spec"].route)
+            stack["factory"].preflight(
+                stack["spec"].route, run_id="sourcefake-run"
+            )
 
     assert error.value.code == "sdk_read_dependencies_unavailable"
     _assert_ambient_exception_is_suppressed(
@@ -1518,7 +1808,9 @@ def test_legacy_sdk_source_identity_api_fails_before_io_and_redacts(
         raise RuntimeError("ambient-private-token")
     except RuntimeError:
         with pytest.raises(SdkReadOnlyError) as error:
-            stack["factory"].preflight(stack["spec"].route)
+            stack["factory"].preflight(
+                stack["spec"].route, run_id="sourcefake-run"
+            )
 
     assert error.value.code == "sdk_market_source_identity_unsupported"
     assert str(error.value) == "sdk_market_source_identity_unsupported"
@@ -1537,7 +1829,7 @@ def test_legacy_sdk_source_identity_api_fails_before_io_and_redacts(
         ),
     )
     with pytest.raises(RuntimeAssemblyError) as assembly_error:
-        assemble_run(_run_config(route), bindings)
+        assemble_run(_run_config(route), bindings, run_id="sourcefake-run")
 
     assert assembly_error.value.code == "provider_binding_preflight_failed"
     assert stack["factory"].owner.runtime is None
@@ -1561,7 +1853,7 @@ def test_kwargs_only_legacy_market_client_fails_before_factory_or_io(monkeypatch
     monkeypatch.setitem(sys.modules, "bt_api_py.service_market", synthetic_market_module)
 
     with pytest.raises(SdkReadOnlyError) as error:
-        stack["factory"].preflight(stack["spec"].route)
+        stack["factory"].preflight(stack["spec"].route, run_id="sourcefake-run")
 
     assert error.value.code == "sdk_market_source_identity_unsupported"
     assert stack["factory"].owner.runtime is None
@@ -1587,7 +1879,9 @@ def test_sdk_config_boundary_suppresses_ambient_exception(monkeypatch, tmp_path)
         raise RuntimeError("ambient-private-token")
     except RuntimeError:
         with pytest.raises(SdkReadOnlyError) as error:
-            stack["factory"].preflight(stack["spec"].route)
+            stack["factory"].preflight(
+                stack["spec"].route, run_id="sourcefake-run"
+            )
 
     assert error.value.code == "client_config_unreadable"
     _assert_ambient_exception_is_suppressed(
@@ -1613,7 +1907,7 @@ def test_sdk_build_boundary_suppresses_ambient_exception(tmp_path):
         raise RuntimeError("ambient-private-token")
     except RuntimeError:
         with pytest.raises(SdkReadOnlyError) as error:
-            factory.build()
+            factory.build(run_id="sourcefake-run")
 
     assert error.value.code == "sdk_facade_construction_failed"
     _assert_ambient_exception_is_suppressed(
@@ -1633,8 +1927,9 @@ def test_assembly_boundary_suppresses_ambient_exception(failure_phase):
     route = _route(Environment.PAPER)
 
     class FailingFactory:
-        def preflight(self, selected_route):
+        def preflight(self, selected_route, *, run_id):
             assert selected_route == route
+            assert run_id == "sourcefake-run"
             if failure_phase == "preflight":
                 raise RuntimeError("preflight-private-token")
             return True
@@ -1657,7 +1952,7 @@ def test_assembly_boundary_suppresses_ambient_exception(failure_phase):
         raise RuntimeError("ambient-private-token")
     except RuntimeError:
         with pytest.raises(RuntimeAssemblyError) as error:
-            assemble_run(_run_config(route), bindings)
+            assemble_run(_run_config(route), bindings, run_id="sourcefake-run")
 
     expected_code = (
         "provider_binding_preflight_failed"
@@ -1683,7 +1978,7 @@ def test_remote_unregister_uncertainty_keeps_owner_unconfirmed(tmp_path):
         tmp_path,
         drop_unregister_response=True,
     )
-    owner = stack["factory"].build()
+    owner = stack["factory"].build(run_id="sourcefake-run")
 
     with pytest.raises(SdkReadOnlyError) as first_close:
         owner.close()

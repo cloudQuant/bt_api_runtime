@@ -245,10 +245,30 @@ def _is_control_interrupt(error: BaseException) -> bool:
     return isinstance(error, (GeneratorExit, KeyboardInterrupt, SystemExit))
 
 
+def _valid_run_id(value: object) -> bool:
+    """Accept one bounded, unambiguous caller-owned run identity."""
+
+    if type(value) is not str or not 1 <= len(value) <= 128:
+        return False
+    if not (
+        "A" <= value[0] <= "Z"
+        or "a" <= value[0] <= "z"
+        or "0" <= value[0] <= "9"
+    ):
+        return False
+    return all(
+        "A" <= character <= "Z"
+        or "a" <= character <= "z"
+        or "0" <= character <= "9"
+        or character in "._:-"
+        for character in value[1:]
+    )
+
+
 def _preflight_v2_provider_factory(
-    provider_factory: object, selected_route: TrustedRouteV2
+    provider_factory: object, selected_route: TrustedRouteV2, run_id: str
 ) -> None:
-    """Require a finite successful preflight before invoking a v2 provider factory."""
+    """Bind the selected route and run identity before a v2 factory is invoked."""
     failed = False
     try:
         preflight = getattr(provider_factory, "preflight", None)
@@ -260,7 +280,7 @@ def _preflight_v2_provider_factory(
 
     if not failed and callable(preflight):
         try:
-            result = preflight(selected_route)
+            result = preflight(selected_route, run_id=run_id)
         except BaseException as error:
             if _is_control_interrupt(error):
                 raise
@@ -666,6 +686,7 @@ class RunSession:
         "_owner_thread_id",
         "_proxy",
         "_ran",
+        "_run_id",
         "_store",
     )
 
@@ -676,6 +697,7 @@ class RunSession:
         broker: BtApiBroker,
         proxy: ServiceReadProxy,
         config: ValidatedRunConfig | ValidatedRunConfigV2,
+        run_id: str | None = None,
     ) -> None:
         self._cerebro = cerebro
         self._store = store
@@ -683,6 +705,7 @@ class RunSession:
         self._proxy = proxy
         self._mode = config.mode
         self._environment = config.environment
+        self._run_id = run_id
         self._owner_thread_id = threading.get_ident()
         self._ran = False
         self._closed = False
@@ -710,6 +733,12 @@ class RunSession:
     @property
     def environment(self):
         return self._environment
+
+    @property
+    def run_id(self) -> str | None:
+        """The explicit code-owned identity bound to a v2 run, if applicable."""
+
+        return self._run_id
 
     @property
     def cleanup_report(self) -> RuntimeCleanupReport | None:
@@ -1378,6 +1407,8 @@ class RunSession:
 def assemble_run(
     source: object,
     registry: RuntimeBindings | RuntimeBindingsV2,
+    *,
+    run_id: str | None = None,
 ) -> RunSession:
     """Parse and revalidate one complete route before creating provider resources.
 
@@ -1389,6 +1420,8 @@ def assemble_run(
     config = parse_config(source)
     strategy_parameters = {}
     if type(config) is ValidatedRunConfig:
+        if run_id is not None:
+            raise RuntimeAssemblyError("run_identity_not_supported")
         contract_registry, bindings = _runtime_registry_parts(registry)
         plan = resolve_plan(config, contract_registry)
         validate_plan(plan, config, contract_registry)
@@ -1396,6 +1429,10 @@ def assemble_run(
             raise RuntimeAssemblyError("plugins_unsupported")
         binding = _select_binding(plan, bindings)
     elif type(config) is ValidatedRunConfigV2:
+        if run_id is None:
+            raise RuntimeAssemblyError("run_identity_required")
+        if not _valid_run_id(run_id):
+            raise RuntimeAssemblyError("run_identity_invalid")
         contract_registry, bindings = _runtime_registry_v2_parts(registry)
         plan = resolve_plan(config, contract_registry)
         validate_plan(plan, config, contract_registry)
@@ -1419,7 +1456,7 @@ def assemble_run(
     # provider identity or authorization. V1 keeps its legacy optional-hook
     # behavior and zero-argument factory contract.
     if type(config) is ValidatedRunConfigV2:
-        _preflight_v2_provider_factory(binding.provider_factory, binding.route)
+        _preflight_v2_provider_factory(binding.provider_factory, binding.route, run_id)
     else:
         preflight = getattr(binding.provider_factory, "preflight", None)
         if callable(preflight):
@@ -1490,7 +1527,14 @@ def assemble_run(
                 raise RuntimeAssemblyError("backtrader_adapter_type_mismatch")
             cerebro.adddata(feed, name=spec.dataname)
         cerebro.setbroker(broker)
-        return RunSession(cerebro, store, broker, proxy, config)
+        return RunSession(
+            cerebro,
+            store,
+            broker,
+            proxy,
+            config,
+            run_id=run_id if type(config) is ValidatedRunConfigV2 else None,
+        )
     except BaseException as primary:
         outcome = _disconnect_proxy(proxy, scope="assembly_proxy")
         _attach_cleanup_report(primary, outcome.report)

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import inspect
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import import_module
 from typing import Any, Callable
 
@@ -191,6 +191,18 @@ _MARKET_OPERATIONS = frozenset(
         "market.history",
     )
 )
+_REGISTERED_RUN_CHECK_CODES = frozenset(
+    (
+        "sdk_runtime_run_id_mismatch",
+        "sdk_registered_binding_set_mismatch",
+        "sdk_registered_binding_inactive",
+        "sdk_registered_scope_mismatch",
+        "sdk_registered_operations_mismatch",
+        "sdk_registered_binding_view_mismatch",
+        "sdk_registered_bindings_unavailable",
+        "sdk_public_stream_scope_mismatch",
+    )
+)
 
 
 def _load_sdk() -> dict[str, Any]:
@@ -254,8 +266,92 @@ def _supports_expected_market_source_identity(sdk: dict[str, Any]) -> bool:
     )
 
 
+def _supports_explicit_run_id(sdk: dict[str, Any]) -> bool:
+    """Require an SDK runtime constructor with an explicit run_id keyword."""
+
+    runtime = sdk.get("ServiceClientRuntime")
+    if not isinstance(runtime, type):
+        return False
+    try:
+        parameter = inspect.signature(runtime).parameters.get("run_id")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
+def _supports_registered_binding_views(sdk: dict[str, Any]) -> bool:
+    """Require public binding-view methods compatible with their real calls."""
+
+    runtime = sdk.get("ServiceClientRuntime")
+    if not isinstance(runtime, type):
+        return False
+    if not isinstance(inspect.getattr_static(runtime, "bindings", None), property):
+        return False
+    calls = (
+        ("account_binding_view", ("store.account", "account-ref")),
+        ("market_binding_view", ("store.market",)),
+    )
+    for name, positional_values in calls:
+        # Inspect the unbound Python function so the bind below accounts for
+        # the instance parameter as well as the arguments used by the factory.
+        method = inspect.getattr_static(runtime, name, None)
+        if not inspect.isfunction(method):
+            return False
+        try:
+            signature = inspect.signature(method)
+            signature.bind(
+                runtime,
+                *positional_values,
+                required_operations=frozenset(),
+            )
+        except (TypeError, ValueError):
+            return False
+        parameters = tuple(signature.parameters.values())
+        positional_parameters = tuple(
+            parameter
+            for parameter in parameters
+            if parameter.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        )
+        expected_names = ("mount", "account_ref")[: len(positional_values)]
+        if len(positional_parameters) < len(expected_names) + 1:
+            return False
+        if tuple(parameter.name for parameter in positional_parameters[1 : 1 + len(expected_names)]) != expected_names:
+            return False
+        required_operations = signature.parameters.get("required_operations")
+        if required_operations is None or required_operations.kind not in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return False
+    return True
+
+
 def _string(value: object) -> bool:
     return type(value) is str and bool(value) and "\x00" not in value
+
+
+def _valid_run_id(value: object) -> bool:
+    """Accept the same bounded identifier as run assembly and WireScope."""
+
+    if type(value) is not str or not 1 <= len(value) <= 128:
+        return False
+    if not (
+        "A" <= value[0] <= "Z"
+        or "a" <= value[0] <= "z"
+        or "0" <= value[0] <= "9"
+    ):
+        return False
+    return all(
+        "A" <= character <= "Z"
+        or "a" <= character <= "z"
+        or "0" <= character <= "9"
+        or character in "._:-"
+        for character in value[1:]
+    )
 
 
 def _market_identity_string(value: object) -> bool:
@@ -448,6 +544,10 @@ def _validate_spec(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, An
         raise SdkReadOnlyError("invalid_sdk_read_spec") from None
     if not _supports_expected_market_source_identity(sdk):
         raise SdkReadOnlyError("sdk_market_source_identity_unsupported") from None
+    if not _supports_explicit_run_id(sdk):
+        raise SdkReadOnlyError("sdk_runtime_run_identity_unsupported") from None
+    if not _supports_registered_binding_views(sdk):
+        raise SdkReadOnlyError("sdk_registered_binding_views_unsupported") from None
     if type(spec.route) is not TrustedRouteV2 or type(spec.references) is not SdkRouteReferencesV2:
         raise SdkReadOnlyError("invalid_sdk_route_mapping") from None
     if type(spec.environment) is not SdkEnvironmentMapping:
@@ -610,6 +710,103 @@ def _validate_spec(spec: SdkReadOnlySpecV2, sdk: dict[str, Any]) -> dict[str, An
         raise SdkReadOnlyError("sdk_scope_mapping_ambiguous") from None
     profile = _validate_config(spec, sdk)
     return profile
+
+
+def _verify_registered_run_bindings(
+    runtime: Any,
+    market_client: Any,
+    sdk: dict[str, Any],
+    spec: SdkReadOnlySpecV2,
+    run_id: str,
+) -> None:
+    """Check the SDK's immutable public registrations against this run map."""
+
+    if type(getattr(runtime, "run_id", None)) is not str or runtime.run_id != run_id:
+        raise SdkReadOnlyError("sdk_runtime_run_id_mismatch") from None
+
+    expected_scopes = {
+        "store.account": replace(
+            spec.account_scope,
+            strategy_ref=spec.identity.actor_ref,
+            run_id=run_id,
+        ),
+        "store.market": replace(
+            spec.market_scope,
+            strategy_ref=spec.identity.actor_ref,
+            run_id=run_id,
+        ),
+    }
+    expected_operations = {
+        "store.account": _ACCOUNT_OPERATIONS,
+        "store.market": _MARKET_OPERATIONS,
+    }
+    try:
+        bindings = runtime.bindings
+        if type(bindings) is not tuple or len(bindings) != 2:
+            raise SdkReadOnlyError("sdk_registered_binding_set_mismatch") from None
+        by_mount = {}
+        for binding in bindings:
+            mount = binding.mount
+            if mount not in expected_scopes or mount in by_mount:
+                raise SdkReadOnlyError("sdk_registered_binding_set_mismatch") from None
+            by_mount[mount] = binding
+            if binding.active is not True:
+                raise SdkReadOnlyError("sdk_registered_binding_inactive") from None
+            if (
+                type(binding.scope) is not sdk["WireScope"]
+                or binding.scope != expected_scopes[mount]
+            ):
+                raise SdkReadOnlyError("sdk_registered_scope_mismatch") from None
+            if (
+                type(binding.operations) is not frozenset
+                or binding.operations != expected_operations[mount]
+            ):
+                raise SdkReadOnlyError("sdk_registered_operations_mismatch") from None
+        if set(by_mount) != set(expected_scopes):
+            raise SdkReadOnlyError("sdk_registered_binding_set_mismatch") from None
+
+        account_view = runtime.account_binding_view(
+            "store.account",
+            spec.account_ref,
+            required_operations=_ACCOUNT_OPERATIONS,
+        )
+        market_view = runtime.market_binding_view(
+            "store.market",
+            required_operations=_MARKET_OPERATIONS,
+        )
+        for mount, view in (
+            ("store.account", account_view),
+            ("store.market", market_view),
+        ):
+            expected_scope_ref = (
+                spec.account_scope_ref
+                if mount == "store.account"
+                else spec.market_scope_ref
+            )
+            if (
+                view.mount != mount
+                or view.service_id != spec.service_id
+                or view.instance_id != spec.instance_id
+                or view.scope_ref != expected_scope_ref
+                or view.rpc_scope != by_mount[mount].scope
+                or view.operations != expected_operations[mount]
+            ):
+                raise SdkReadOnlyError("sdk_registered_binding_view_mismatch") from None
+        if account_view.account_ref != spec.account_ref:
+            raise SdkReadOnlyError("sdk_registered_binding_view_mismatch") from None
+    except SdkReadOnlyError:
+        raise
+    except Exception:  # noqa: BLE001 - expose only finite public binding diagnostics
+        raise SdkReadOnlyError("sdk_registered_bindings_unavailable") from None
+
+    stream_scope = getattr(market_client, "stream_scope", None)
+    if (
+        type(stream_scope) is not sdk["WireScope"]
+        or stream_scope != spec.stream_scope
+        or stream_scope.run_id is not None
+        or stream_scope.strategy_ref is not None
+    ):
+        raise SdkReadOnlyError("sdk_public_stream_scope_mismatch") from None
 
 
 class SdkReadOnlyResourceOwner:
@@ -787,6 +984,7 @@ class SdkReadOnlyFacadeFactory:
         "_owner",
         "_owner_thread_id",
         "_profile",
+        "_run_id",
         "_sdk",
         "_spec",
         "_used",
@@ -799,6 +997,7 @@ class SdkReadOnlyFacadeFactory:
         self._owner = SdkReadOnlyResourceOwner()
         self._owner_thread_id = threading.get_ident()
         self._profile = None
+        self._run_id = None
         self._sdk = None
         self._used = False
 
@@ -813,8 +1012,8 @@ class SdkReadOnlyFacadeFactory:
 
         return self.build().proxy
 
-    def preflight(self, selected_route: object) -> bool:
-        """Validate this spec against the route selected by ``assemble_run``.
+    def preflight(self, selected_route: object, *, run_id: str) -> bool:
+        """Bind this factory to the selected route and caller-owned run ID.
 
         This is a consistency check before the provider factory. It is not a
         provider identity check, credential validation, or authorization.
@@ -824,20 +1023,34 @@ class SdkReadOnlyFacadeFactory:
             raise SdkReadOnlyError("sdk_factory_wrong_thread") from None
         if self._used:
             raise SdkReadOnlyError("sdk_factory_already_used") from None
+        if not _valid_run_id(run_id):
+            raise SdkReadOnlyError("sdk_run_identity_invalid") from None
+        if self._run_id is not None and self._run_id != run_id:
+            raise SdkReadOnlyError("sdk_run_identity_mismatch") from None
         if type(selected_route) is not TrustedRouteV2 or selected_route != self._spec.route:
             raise SdkReadOnlyError("sdk_selected_route_mismatch") from None
         sdk = _load_sdk()
         self._profile = _validate_spec(self._spec, sdk)
         self._sdk = sdk
+        self._run_id = run_id
         return True
 
-    def build(self) -> SdkReadOnlyResourceOwner:
+    def build(self, *, run_id: str | None = None) -> SdkReadOnlyResourceOwner:
         if threading.get_ident() != self._owner_thread_id:
             raise SdkReadOnlyError("sdk_factory_wrong_thread") from None
         if self._used:
             raise SdkReadOnlyError("sdk_factory_already_used") from None
+        if run_id is not None:
+            if not _valid_run_id(run_id):
+                raise SdkReadOnlyError("sdk_run_identity_invalid") from None
+            if self._run_id is not None and self._run_id != run_id:
+                raise SdkReadOnlyError("sdk_run_identity_mismatch") from None
+            if self._profile is None:
+                self.preflight(self._spec.route, run_id=run_id)
+        if self._run_id is None:
+            raise SdkReadOnlyError("sdk_run_identity_required") from None
         if self._profile is None:
-            self.preflight(self._spec.route)
+            raise SdkReadOnlyError("sdk_factory_preflight_required") from None
         self._used = True
 
         # All reference, environment, identity, account, endpoint, scope,
@@ -849,6 +1062,7 @@ class SdkReadOnlyFacadeFactory:
         if type(profile) is not dict or type(sdk) is not dict:
             raise SdkReadOnlyError("sdk_factory_preflight_unavailable") from None
         spec = self._spec
+        run_id = self._run_id
 
         def scope_resolver(scope_ref: str):
             if scope_ref == spec.account_scope_ref:
@@ -884,12 +1098,15 @@ class SdkReadOnlyFacadeFactory:
                 scope_resolver=scope_resolver,
                 peer_resolver=peer_resolver,
                 transport_factory=transport_factory,
+                run_id=run_id,
                 requested_operations={
                     "store.account": _ACCOUNT_OPERATIONS,
                     "store.market": _MARKET_OPERATIONS,
                 },
             )
             owner._runtime = runtime
+            if type(getattr(runtime, "run_id", None)) is not str or runtime.run_id != run_id:
+                raise SdkReadOnlyError("sdk_runtime_run_id_mismatch") from None
 
             account_client = sdk["ServiceAccountClient"](
                 runtime,
@@ -938,7 +1155,14 @@ class SdkReadOnlyFacadeFactory:
             # ServiceClientRuntime.start is the first operation that may call
             # transport_factory; the complete static map has already passed.
             runtime.start()
+            _verify_registered_run_bindings(runtime, market_client, sdk, spec, run_id)
             owner._state = "ready"
+        except SdkReadOnlyError as error:
+            failure_code = (
+                error.code
+                if error.code in _REGISTERED_RUN_CHECK_CODES
+                else "sdk_facade_construction_failed"
+            )
         except Exception:  # noqa: BLE001 - map SDK/setup details to one finite public error
             failure_code = "sdk_facade_construction_failed"
         except BaseException as error:  # noqa: BLE001 - clean up, then propagate controls unchanged

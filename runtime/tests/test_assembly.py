@@ -57,6 +57,7 @@ from bt_api_runtime import (
 
 _NOW = datetime(2026, 10, 1, 12, 3, tzinfo=timezone.utc)
 _OBSERVED_AT = "2026-10-01T12:03:00Z"
+_TEST_RUN_ID = "assembly-test-run"
 
 
 class _CleanupAbort(BaseException):
@@ -388,8 +389,8 @@ def _runtime_bindings_v2(created, factory_calls=None, *, paper_capabilities=None
 
         expected_route = paper if environment is Environment.PAPER else live
 
-        def preflight(selected_route):
-            return selected_route is expected_route
+        def preflight(selected_route, *, run_id):
+            return selected_route is expected_route and run_id == _TEST_RUN_ID
 
         # This minimal hook exercises the generic V2 assembly contract only;
         # SDK route mapping is covered by the real-factory source-fake tests.
@@ -498,6 +499,7 @@ def test_same_registered_strategy_runs_through_real_engine_in_paper_and_live():
     for environment in (Environment.PAPER, Environment.LIVE):
         session = assemble_run(_yaml_config(routes[environment]), registry)
         assert session.environment is environment
+        assert session.run_id is None
         strategies = session.run()
         (strategy,) = strategies
         results.append(strategy)
@@ -579,7 +581,7 @@ requested_capabilities:
 
     registry, _routes = _runtime_bindings(created, paper_factory=counted_factory)
     with pytest.raises(RuntimeAssemblyError) as caught:
-        assemble_run(source, registry)
+        assemble_run(source, registry, run_id=_TEST_RUN_ID)
 
     assert caught.value.code == "invalid_runtime_registry"
     assert factory_calls == []
@@ -595,8 +597,9 @@ def test_schema_v2_assembles_same_strategy_parameters_and_real_feed_in_paper_and
     for environment in (Environment.PAPER, Environment.LIVE):
         source = _yaml_v2_config(routes[environment])
         assert isinstance(parse_config(source), ValidatedRunConfigV2)
-        session = assemble_run(source, registry)
+        session = assemble_run(source, registry, run_id=_TEST_RUN_ID)
         assert session.environment is environment
+        assert session.run_id == _TEST_RUN_ID
         (strategy,) = session.run()
         assert type(strategy) is _ConfiguredObserver
         assert type(strategy.broker) is BtApiBroker
@@ -628,6 +631,63 @@ def test_schema_v2_assembles_same_strategy_parameters_and_real_feed_in_paper_and
         assert market.close_calls == 1
         assert account.write_calls == []
         assert market.write_calls == []
+
+
+@pytest.mark.parametrize(
+    "run_id, expected_code",
+    (
+        (None, "run_identity_required"),
+        ("", "run_identity_invalid"),
+        (" leading", "run_identity_invalid"),
+        ("has/slash", "run_identity_invalid"),
+        ("non-ascii-ñ", "run_identity_invalid"),
+        ("x" * 129, "run_identity_invalid"),
+    ),
+)
+def test_schema_v2_rejects_missing_or_malformed_run_identity_before_factory(
+    run_id, expected_code
+):
+    created = []
+    factory_calls = []
+    registry, routes = _runtime_bindings_v2(created, factory_calls)
+    preflight_calls = []
+    factory = registry.bindings[0].provider_factory
+    original_preflight = factory.preflight
+
+    def observed_preflight(selected_route, *, run_id):
+        preflight_calls.append((selected_route, run_id))
+        return original_preflight(selected_route, run_id=run_id)
+
+    factory.preflight = observed_preflight
+    source = _yaml_v2_config(routes[Environment.PAPER])
+
+    with pytest.raises(RuntimeAssemblyError) as caught:
+        if run_id is None:
+            assemble_run(source, registry)
+        else:
+            assemble_run(source, registry, run_id=run_id)
+
+    assert caught.value.code == expected_code
+    assert preflight_calls == []
+    assert factory_calls == []
+    assert created == []
+
+
+def test_schema_v2_factory_preflight_binds_session_run_identity_before_call():
+    created = []
+    factory_calls = []
+    registry, routes = _runtime_bindings_v2(created, factory_calls)
+
+    with pytest.raises(RuntimeAssemblyError) as caught:
+        assemble_run(
+            _yaml_v2_config(routes[Environment.PAPER]),
+            registry,
+            run_id="different-run",
+        )
+
+    assert caught.value.code == "provider_binding_preflight_failed"
+    assert factory_calls == []
+    assert created == []
 
 
 @pytest.mark.parametrize(
@@ -666,15 +726,15 @@ def test_schema_v2_requires_strict_successful_preflight_before_provider_factory(
             factory.preflight = 0
         elif factory_case != "missing":
 
-            def preflight(selected_route):
-                preflight_calls.append(selected_route)
+            def preflight(selected_route, *, run_id):
+                preflight_calls.append((selected_route, run_id))
                 if factory_case == "false":
                     return False
                 if factory_case == "integer_one":
                     return 1
                 if factory_case == "hook_exception":
                     raise RuntimeError("private preflight invocation detail")
-                return selected_route is route
+                return selected_route is route and run_id == _TEST_RUN_ID
 
             factory.preflight = preflight
 
@@ -684,7 +744,7 @@ def test_schema_v2_requires_strict_successful_preflight_before_provider_factory(
     )
 
     with pytest.raises(RuntimeAssemblyError) as caught:
-        assemble_run(_yaml_v2_config(route), registry)
+        assemble_run(_yaml_v2_config(route), registry, run_id=_TEST_RUN_ID)
 
     assert caught.value.code == "provider_binding_preflight_failed"
     assert caught.value.__context__ is None
@@ -692,7 +752,7 @@ def test_schema_v2_requires_strict_successful_preflight_before_provider_factory(
     assert provider_calls == []
     assert created == []
     if factory_case in ("false", "integer_one", "hook_exception"):
-        assert preflight_calls == [route]
+        assert preflight_calls == [(route, _TEST_RUN_ID)]
     else:
         assert preflight_calls == []
 
@@ -782,7 +842,7 @@ def test_schema_v2_rejects_capability_plugin_route_mode_and_parameter_mismatches
     source = _yaml_v2_config(routes[Environment.PAPER], **options)
 
     with pytest.raises((RunConfigError, RuntimeAssemblyError)) as caught:
-        assemble_run(source, registry)
+        assemble_run(source, registry, run_id=_TEST_RUN_ID)
 
     assert caught.value.code == expected_code
     assert factory_calls == []
@@ -799,7 +859,11 @@ def test_schema_v2_requires_the_code_route_to_declare_both_read_capabilities():
     )
 
     with pytest.raises(RunConfigError) as caught:
-        assemble_run(_yaml_v2_config(routes[Environment.PAPER]), registry)
+        assemble_run(
+            _yaml_v2_config(routes[Environment.PAPER]),
+            registry,
+            run_id=_TEST_RUN_ID,
+        )
 
     assert caught.value.code == "capability_not_declared"
     assert factory_calls == []
