@@ -82,6 +82,15 @@ provider is truly paper/live, and not full A1 acceptance. Local tests fake the
 outer account and market clients only. `replay`, `shadow`, plugin execution,
 legacy local paper simulation, and order routing are unsupported.
 
+A separate local source-fake test composes the real SDK client runtime, account
+and market facades, ServiceRegistry, Backtrader proxy and engine. Only transport,
+subscriber and service responses are synthetic. It covers the same strategy in
+paper/live, a locally rejected buy with no write RPC, and retention followed by
+a retry after an injected facade-close failure. The two focused tests passed
+on Python 3.11 using local source dependencies. The test checks timeout values
+are passed to the fake transport; it does not verify effective transport timeout
+enforcement, real network cleanup, provider identity or account acceptance.
+
 The intended source-checkout sequence is to install `bt_api_run_contract`,
 `bt_api_base`, and the required Backtrader build in the environment, then install
 this runtime directory. On Python 3.11.5, the focused source suite passed 38
