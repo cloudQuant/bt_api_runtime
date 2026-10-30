@@ -14,18 +14,30 @@ fall back to the legacy `paper` local simulation.
 
 Route identifiers and environment labels are only configuration selectors. They
 do not prove which endpoint, account, credentials, provider, or permissions a
-factory actually uses. The application-supplied factory is a deployment trust
-boundary and must return a fresh Backtrader `ServiceReadProxy`; the proxy closes
-its injected account and market facades, while the application remains
-responsible for any shared SDK runtime. This repository does not yet provide a
-concrete SDK-to-service-facade factory. Backtrader's current Store startup also
-requires a complete read-only account snapshot to initialize its broker, so this
-candidate's live path includes read-only account observations as well as bars.
+factory actually uses. Generic application-supplied factories remain a
+deployment trust boundary and must return a fresh Backtrader `ServiceReadProxy`;
+the application owns any SDK runtime shared by those factories. The runtime also
+provides an optional, code-owned `SdkReadOnlyFacadeFactory` for one v2 route. Its
+`preflight(selected_route)` checks route/config consistency before factory I/O.
+Its resource owner retains the SDK runtime, account and market facades, and proxy;
+after the session closes the per-run proxy, the application calls
+`factory.owner.close()` to finish that owner's cleanup.
+
+Current verification of this SDK composition is local source-fake only: it
+exercises the real SDK runtime and facades with synthetic transport, subscriber,
+and service-response leaves. Route preflight proves only configuration
+consistency, and the owner tests cover local resource lifecycle behavior. Actual
+provider/source identity, source-descriptor truth, clock calibration, account
+authorization, and real-account acceptance remain **NOT_PROVEN**. Backtrader's
+current Store startup also requires a complete read-only account snapshot to
+initialize its broker, so this candidate's live path includes read-only account
+observations as well as bars.
 
 The runtime candidate is not a permission system, provider identity check, live
-account acceptance, or complete I52 A1 acceptance. Its local tests fake only the
-outer account and market I/O clients while exercising the real proxy, Store,
-Feed, Broker, and Cerebro. `replay`, `shadow`, plugin execution, local paper
+account acceptance, or complete I52 A1 acceptance. The focused SDK source-fake
+test exercises the real SDK runtime, account and market facades, ServiceRegistry,
+Backtrader proxy, and engine; only the transport, subscriber, and service-response
+leaves are synthetic. `replay`, `shadow`, plugin execution, local paper
 simulation, and order routing are unsupported. See the [Trading System
 Architecture](https://github.com/cloudQuant/backtrader/blob/dev/docs/TRADING_SYSTEM_ARCHITECTURE.md).
 
