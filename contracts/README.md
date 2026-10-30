@@ -2,7 +2,7 @@
 
 This directory is an independent build root for the `bt_api_run_contract`
 package. It has two explicitly versioned YAML schemas and depends at runtime only on
-PyYAML and the Python standard library. Package metadata is version `0.1.4` for
+PyYAML and the Python standard library. Package metadata is version `0.1.5` for
 this source candidate; this change is not a release.
 
 The 0.1.2 wheel was built and tested from separate target directories on
@@ -19,6 +19,11 @@ The 0.1.4 wheel updates the parser documentation; installed-target checks
 passed 56 tests each on Python 3.8 and 3.11 using existing interpreter
 environments. Wheel SHA-256:
 `bf02fec88e160c05e528b9c1fee6ef939e37ae3ed10dce3186bc716f18bf0ab9`.
+
+The 0.1.5 source candidate rejects every Unicode `Cc` control character in
+bounded strategy-parameter strings and nested mapping keys, while retaining
+ordinary non-ASCII text. The Python 3.11.5 source contract suite passed 57
+tests. No 0.1.5 wheel or release is claimed.
 
 Schema version 1 accepts `paper` and `live` configuration documents. The
 `mode` and `environment` must match. The names `replay` and `shadow` are

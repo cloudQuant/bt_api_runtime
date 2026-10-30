@@ -27,7 +27,8 @@ references, static capability declaration, and strategy-parameter contract to
 one code-owned strategy class, feed set, and provider factory before invoking
 that factory.
 
-The current source candidate is version 0.1.10. It includes an optional
+The current source candidate is version 0.1.11 and pins the contract package
+at `bt-api-run-contract==0.1.5`. It includes an optional
 lazy-imported SDK read-only facade factory and resource owner; the Python 3.11+
 SDK remains absent from the runtime's required dependencies so ordinary
 package imports continue to support Python 3.9+.

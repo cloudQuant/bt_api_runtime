@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from math import isfinite
 from typing import Dict, Tuple, Union
+from unicodedata import category as _unicode_category
 
 import yaml
 from yaml.events import (
@@ -487,7 +488,7 @@ def _valid_bounded_text(
     except UnicodeEncodeError:
         return False
     return len(encoded) <= max_bytes and not any(
-        ord(char) < 0x20 or ord(char) == 0x7F for char in value
+        _unicode_category(char) == "Cc" for char in value
     )
 
 

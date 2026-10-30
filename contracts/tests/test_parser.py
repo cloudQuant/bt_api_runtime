@@ -354,6 +354,22 @@ class ParseConfigTests(unittest.TestCase):
         )
         self.assert_code("strategy_parameters_too_large", _v2_config(parameters=too_many))
 
+    def test_v2_parameter_strings_and_map_keys_reject_unicode_controls(self):
+        self.assert_code(
+            "invalid_strategy_parameter_value",
+            _v2_config(parameters='  label: "\\u0085"\n'),
+        )
+        self.assert_code(
+            "invalid_strategy_parameter_value",
+            _v2_config(parameters='  nested:\n    "\\u009f": value\n'),
+        )
+        self.assertEqual(
+            parse_config(_v2_config(parameters='  label: "café"\n')).strategy_parameter(
+                "label"
+            ),
+            "café",
+        )
+
     def test_v2_nested_parameters_are_bounded_and_deeply_immutable(self):
         source = _v2_config(
             parameters=(
