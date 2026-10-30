@@ -25,6 +25,22 @@ _MESSAGES: Dict[str, str] = {
     "invalid_plugins": "Config plugins must be a mapping of symbolic identifiers to booleans.",
     "invalid_plugin_name": "Config contains an invalid plugin identifier.",
     "invalid_plugin_value": "Every plugin value must be an explicit YAML boolean.",
+    "invalid_registry": "Trusted route registry is invalid.",
+    "empty_registry": "Trusted route registry must contain at least one route.",
+    "invalid_route": "Trusted route binding is invalid.",
+    "duplicate_route": "Trusted route registry contains a duplicate complete binding.",
+    "cross_environment_reference": (
+        "A sensitive route reference is reused across paper and live environments."
+    ),
+    "invalid_resolution_input": "Reference resolution requires a validated run config.",
+    "plan_mismatch": "Resolved plan does not match the supplied run config.",
+    "direct_plan_construction": "Resolved plans cannot be constructed through the public API.",
+    "unregistered_route": "No trusted route is registered for this provider.",
+    "route_environment_mismatch": (
+        "No trusted route is registered for this provider and environment."
+    ),
+    "route_mismatch": "Run config references do not match the trusted route binding.",
+    "plugin_resolution_deferred": "Enabled plugins cannot be resolved by this route registry.",
 }
 
 
