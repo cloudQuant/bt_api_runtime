@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import datetime, timezone
+import builtins
 import threading
 import time
+import traceback
+from dataclasses import fields, replace
+from datetime import datetime, timezone
 
 import backtrader as bt
 import pytest
@@ -13,7 +15,7 @@ from backtrader.brokers.btapibroker import BtApiBroker
 from backtrader.cerebro import Cerebro
 from backtrader.feeds.btapifeed import BtApiFeed
 from backtrader.stores.btapistore import BtApiStore
-from backtrader.stores.service_read_proxy import ServiceFeedBinding, ServiceReadProxy
+from backtrader.stores.service_read_proxy import ServiceReadProxy
 from bt_api_base.account_protocol import (
     AccountBalance,
     AccountKey,
@@ -26,7 +28,11 @@ from bt_api_base.market_history_protocol import (
     MarketHistoryPage,
     MarketHistoryRequest,
 )
-from bt_api_base.market_protocol import MarketInstrumentKey, MarketSubscriptionKey
+from bt_api_base.market_protocol import (
+    MarketInstrumentKey,
+    MarketSourceDescriptor,
+    MarketSubscriptionKey,
+)
 from bt_api_base.service_protocol import (
     WireEnvelope,
     WireIdentity,
@@ -50,11 +56,19 @@ from bt_api_run_contract import (
     TrustedRegistryV2,
     TrustedRouteV2,
 )
+
 from bt_api_runtime import (
     FeedSpec,
     RouteBindingV2,
     RuntimeAssemblyError,
     RuntimeBindingsV2,
+    SdkClockBinding,
+    SdkEnvironmentMapping,
+    SdkReadOnlyError,
+    SdkReadOnlyFacadeFactory,
+    SdkReadOnlySpecV2,
+    SdkRouteReference,
+    SdkRouteReferencesV2,
     assemble_run,
 )
 
@@ -152,7 +166,6 @@ class _SourceFakeEventSubscriber:
         if timeout is not None and timeout < 0:
             raise AssertionError("subscriber received a negative timeout")
         self.receive_calls += 1
-        return None
 
     def close(self) -> None:
         self.close_calls += 1
@@ -246,13 +259,26 @@ class _SyntheticReadService:
         if operation == "market.subscribe":
             already_subscribed = registration_id in self.market_registrations
             self.market_registrations.add(registration_id)
-            return {
+            reply = {
                 "stream_id": stream_id,
                 "epoch": _STREAM_EPOCH,
                 "head": 0,
                 "oldest_sequence": 1,
                 "already_subscribed": already_subscribed,
             }
+            if arguments.get("require_source_descriptor") is True:
+                reply["source_descriptor"] = MarketSourceDescriptor(
+                    key=key,
+                    stream_id=stream_id,
+                    epoch=_STREAM_EPOCH,
+                    provider=key.instrument.provider,
+                    source="source-fake-provider-route",
+                    connection_generation=1,
+                    clock_domain_id="source-fake-clock-domain",
+                    clock_source_session_id="source-fake-clock-session",
+                    clock_source="source-fake-clock-source",
+                ).to_dict()
+            return reply
         if operation == "market.unsubscribe":
             self.market_registrations.discard(registration_id)
             return {
@@ -323,12 +349,20 @@ class _SyntheticReadService:
 class _LocalRequestReplyTransport:
     """Only the outer RPC/I/O leaf is replaced; the SDK runtime stays real."""
 
-    def __init__(self, registry: ServiceRegistry, principal_ref: str, peer: WireIdentity):
+    def __init__(
+        self,
+        registry: ServiceRegistry,
+        principal_ref: str,
+        peer: WireIdentity,
+        *,
+        drop_unregister_response: bool = False,
+    ):
         self.registry = registry
         self.principal_ref = principal_ref
         self.peer = peer
         self.operations: list[str] = []
         self.closed = False
+        self.drop_unregister_response = drop_unregister_response
 
     def request(self, request: WireEnvelope, *, timeout: float) -> WireEnvelope:
         if self.closed:
@@ -337,6 +371,12 @@ class _LocalRequestReplyTransport:
             raise AssertionError("RPC timeout was not explicitly bounded")
         self.operations.append(request.header.operation)
         result = self.registry.handle(self.principal_ref, request)
+        if (
+            request.header.operation == "service.unregister"
+            and self.drop_unregister_response
+        ):
+            self.drop_unregister_response = False
+            raise OSError("synthetic unregister response loss")
         return WireEnvelope(
             replace(
                 request.header,
@@ -386,72 +426,6 @@ def _sdk_product_type(route_product_ref: str) -> str:
         raise AssertionError("synthetic route has no SDK product-type mapping") from None
 
 
-class _RetainedResourceOwner:
-    """Strongly retain uncertain read-facade/runtime/registry closure state."""
-
-    def __init__(self) -> None:
-        self._retained: list[dict[str, object]] = []
-
-    @property
-    def retained(self) -> tuple[dict[str, object], ...]:
-        return tuple(self._retained)
-
-    def close_resources(
-        self,
-        resources: dict[str, object],
-        *,
-        facade_close_confirmed: bool = False,
-    ) -> bool:
-        try:
-            if not facade_close_confirmed:
-                proxy = resources.get("proxy")
-                if proxy is not None:
-                    proxy.disconnect()
-                else:
-                    errors = []
-                    for name in ("market_client", "account_client"):
-                        facade = resources.get(name)
-                        if facade is not None:
-                            try:
-                                facade.close()
-                            except BaseException as error:
-                                errors.append(error)
-                    if errors:
-                        raise errors[0]
-
-            runtime = resources.get("runtime")
-            if runtime is not None:
-                runtime.close()
-                if runtime.state != "closed":
-                    raise RuntimeError("runtime_close_unconfirmed")
-
-            registry = resources.get("registry")
-            if registry is not None:
-                registry.close()
-        except BaseException:
-            self.retain(resources)
-            return False
-
-        self._forget(resources)
-        return True
-
-    def retain(self, resources: dict[str, object]) -> None:
-        if not any(item is resources for item in self._retained):
-            self._retained.append(resources)
-
-    def retry_one(self) -> bool:
-        if not self._retained:
-            return False
-        resources = self._retained[0]
-        return self.close_resources(resources)
-
-    def _forget(self, resources: dict[str, object]) -> None:
-        self._retained[:] = [item for item in self._retained if item is not resources]
-
-
-_RETAINED_RESOURCE_OWNER = _RetainedResourceOwner()
-
-
 def _run_config(route: TrustedRouteV2) -> str:
     refs = route.references
     lines = [
@@ -492,265 +466,242 @@ def _make_stack(
     tmp_path,
     *,
     subscriber_close_failures: int = 0,
+    drop_unregister_response: bool = False,
+    route: TrustedRouteV2 | None = None,
 ):
     suffix = environment.value
-    phase = "synthetic_domain"
-    registry = None
-    runtime = None
-    proxy = None
-    account_client = None
-    market_client = None
-    subscriber = None
-    transport = None
-    service = None
-    try:
-        service_id = f"synthetic-service-{suffix}"
-        instance_id = f"synthetic-gateway-{suffix}"
-        account_ref = f"synthetic-account-{suffix}"
-        account_scope_ref = f"synthetic-account-scope-{suffix}"
-        market_scope_ref = f"synthetic-market-scope-{suffix}"
-        transport_ref = f"synthetic-client-{suffix}"
-        client = WireIdentity(
-            WireRole.STRATEGY_CLIENT,
-            f"synthetic-principal-{suffix}",
-            _sdk_strategy_ref(_STRATEGY_REF),
-        )
-        peer = WireIdentity(
-            WireRole.SERVICE,
-            f"synthetic-service-principal-{suffix}",
-            service_id,
-        )
-        account_key = AccountKey(
-            provider="synthetic",
-            venue="source-fake",
-            environment=suffix,
-            account_id=account_ref,
-        )
-        resource = AccountResourceKey("spot", "synthetic-cash")
-        instrument = MarketInstrumentKey(
-            provider="synthetic",
-            venue="source-fake",
-            environment=suffix,
-            product_type=_sdk_product_type(_PRODUCT_REF),
-            instrument_id="synthetic-instrument",
-            native_symbol="SYNTH-USD",
-        )
-        market_key = MarketSubscriptionKey(
-            source_ref="synthetic-market-source",
-            entitlement_ref="synthetic-market-entitlement",
-            instrument=instrument,
-            channel="bar",
-            timeframe="1m",
-        )
-        account_scope = WireScope(
-            _DOMAIN_REF,
-            account_ref=account_ref,
-            strategy_ref=_sdk_strategy_ref(_STRATEGY_REF),
-        )
-        market_scope = WireScope(
-            _DOMAIN_REF,
-            strategy_ref=_sdk_strategy_ref(_STRATEGY_REF),
-        )
+    route = route or _route(environment)
+    service_id = f"synthetic-service-{suffix}"
+    instance_id = f"synthetic-gateway-{suffix}"
+    account_ref = f"synthetic-account-{suffix}"
+    account_scope_ref = f"synthetic-account-scope-{suffix}"
+    market_scope_ref = f"synthetic-market-scope-{suffix}"
+    transport_ref = f"synthetic-client-{suffix}"
+    sdk_strategy_ref = _sdk_strategy_ref(route.references.strategy)
+    client = WireIdentity(
+        WireRole.STRATEGY_CLIENT,
+        f"synthetic-principal-{suffix}",
+        sdk_strategy_ref,
+    )
+    peer = WireIdentity(
+        WireRole.SERVICE,
+        f"synthetic-service-principal-{suffix}",
+        service_id,
+    )
+    account_key = AccountKey(
+        provider="synthetic",
+        venue="source-fake",
+        environment=suffix,
+        account_id=account_ref,
+    )
+    resource = AccountResourceKey("spot", "synthetic-cash")
+    instrument = MarketInstrumentKey(
+        provider="synthetic",
+        venue="source-fake",
+        environment=suffix,
+        product_type=_sdk_product_type(route.references.product),
+        instrument_id="synthetic-instrument",
+        native_symbol="SYNTH-USD",
+    )
+    market_key = MarketSubscriptionKey(
+        source_ref="synthetic-market-source",
+        entitlement_ref="synthetic-market-entitlement",
+        instrument=instrument,
+        channel="bar",
+        timeframe="1m",
+    )
+    account_scope = WireScope(
+        _DOMAIN_REF,
+        account_ref=account_ref,
+        strategy_ref=sdk_strategy_ref,
+    )
+    market_scope = WireScope(
+        _DOMAIN_REF,
+        strategy_ref=sdk_strategy_ref,
+    )
+    stream_scope = WireScope(_DOMAIN_REF)
+    scope_dimension_names = {
+        "account_ref",
+        "account_refs",
+        "strategy_ref",
+        "run_id",
+        "manual_book_ref",
+        "portfolio_ref",
+        "group_id",
+        "leg_id",
+    }
+    scope_fields = tuple(field.name for field in fields(WireScope))
+    scope_context_field = next(
+        name for name in scope_fields if name not in scope_dimension_names
+    )
 
-        capability = (
-            ServiceCapability(
-                instance_id, "service.account_read", _SERVICE_ACCOUNT_OPERATIONS
-            ),
-            ServiceCapability(
-                instance_id, "service.market_source", _SERVICE_MARKET_OPERATIONS
-            ),
-        )
-        grants = (
-            ResourceGrant(
-                instance_id,
-                "service.account_read",
-                account_scope_ref,
-                account_scope,
-                _SERVICE_ACCOUNT_OPERATIONS,
-            ),
-            ResourceGrant(
-                instance_id,
-                "service.market_source",
-                market_scope_ref,
-                market_scope,
-                _SERVICE_MARKET_OPERATIONS,
-            ),
-        )
-        phase = "service_registry_create"
-        registry = ServiceRegistry(
-            tmp_path / f"source-fake-{suffix}.sqlite3",
-            service_id=service_id,
-            capabilities=capability,
-            grants={client.principal_ref: (PrincipalGrant(client, grants),)},
-            policy_version="source-fake-policy-v1",
-            requirements_version="source-fake-requirements-v1",
-            lease_seconds=30,
-        )
-        service = _SyntheticReadService(account_key, resource, instrument, account_ref)
-        phase = "service_registry_handlers"
+    capability = (
+        ServiceCapability(instance_id, "service.account_read", _SERVICE_ACCOUNT_OPERATIONS),
+        ServiceCapability(instance_id, "service.market_source", _SERVICE_MARKET_OPERATIONS),
+    )
+    grants = (
+        ResourceGrant(
+            instance_id,
+            "service.account_read",
+            account_scope_ref,
+            account_scope,
+            _SERVICE_ACCOUNT_OPERATIONS,
+        ),
+        ResourceGrant(
+            instance_id,
+            "service.market_source",
+            market_scope_ref,
+            market_scope,
+            _SERVICE_MARKET_OPERATIONS,
+        ),
+    )
+    registry = ServiceRegistry(
+        tmp_path / f"source-fake-{suffix}.sqlite3",
+        service_id=service_id,
+        capabilities=capability,
+        grants={client.principal_ref: (PrincipalGrant(client, grants),)},
+        policy_version="source-fake-policy-v1",
+        requirements_version="source-fake-requirements-v1",
+        lease_seconds=30,
+    )
+    service = _SyntheticReadService(account_key, resource, instrument, account_ref)
+    registry.register_handler(instance_id, "account.snapshot", service.account_snapshot)
+    for operation in _SERVICE_MARKET_OPERATIONS:
         registry.register_handler(
-            instance_id, "account.snapshot", service.account_snapshot
+            instance_id,
+            operation,
+            lambda context, arguments, selected=operation: service.market(
+                context, arguments, selected
+            ),
         )
-        for operation in _SERVICE_MARKET_OPERATIONS:
-            registry.register_handler(
-                instance_id,
-                operation,
-                lambda context, arguments, selected=operation: service.market(
-                    context, arguments, selected
-                ),
-            )
-        registry.set_ready(True)
+    registry.set_ready(True)
 
-        transport = _LocalRequestReplyTransport(registry, client.principal_ref, peer)
-        raw_config = {
-            "client_config_schema_version": 1,
-            "process_role": "strategy_client",
-            "registration": {
-                "strategy_ref": _sdk_strategy_ref(_STRATEGY_REF),
-            },
-            "clients": {
-                "gateway": {
+    transport = _LocalRequestReplyTransport(
+        registry,
+        client.principal_ref,
+        peer,
+        drop_unregister_response=drop_unregister_response,
+    )
+    raw_config = {
+        "client_config_schema_version": 1,
+        "process_role": "strategy_client",
+        "registration": {"strategy_ref": sdk_strategy_ref},
+        "clients": {
+            "gateway": {
+                "config_schema_version": 1,
+                "settings": {
+                    "bindings": [
+                        {
+                            "mount": "store.account",
+                            "service_id": service_id,
+                            "instance_id": instance_id,
+                            "scope_ref": account_scope_ref,
+                            "account_ref": account_ref,
+                            "transport_ref": transport_ref,
+                        },
+                        {
+                            "mount": "store.market",
+                            "service_id": service_id,
+                            "instance_id": instance_id,
+                            "scope_ref": market_scope_ref,
+                            "transport_ref": transport_ref,
+                        },
+                    ],
+                    "options": {"request_timeout_ms": 1_000},
+                },
+            }
+        },
+        "communication": {
+            "config_schema_version": 1,
+            "profiles": {
+                transport_ref: {
+                    "backend": "zmq",
                     "config_schema_version": 1,
-                    "settings": {
-                        "bindings": [
-                            {
-                                "mount": "store.account",
-                                "service_id": service_id,
-                                "instance_id": instance_id,
-                                "scope_ref": account_scope_ref,
-                                "account_ref": account_ref,
-                                "transport_ref": transport_ref,
-                            },
-                            {
-                                "mount": "store.market",
-                                "service_id": service_id,
-                                "instance_id": instance_id,
-                                "scope_ref": market_scope_ref,
-                                "transport_ref": transport_ref,
-                            },
-                        ],
-                        "options": {"request_timeout_ms": 1_000},
+                    "endpoints": {
+                        "rpc_connect": "tcp://127.0.0.1:1",
+                        "market_connect": "tcp://127.0.0.1:2",
+                    },
+                    "security_profile_ref": "source-fake-keys",
+                    "options": {
+                        "request_timeout_ms": 1_000,
+                        "high_water_mark": 16,
+                        "max_message_bytes": 262_144,
                     },
                 }
             },
-            "communication": {
-                "config_schema_version": 1,
-                "profiles": {
-                    transport_ref: {
-                        "backend": "zmq",
-                        "config_schema_version": 1,
-                        "endpoints": {
-                            "rpc_connect": "tcp://127.0.0.1:1",
-                            "market_connect": "tcp://127.0.0.1:2",
-                        },
-                        "security_profile_ref": "source-fake-keys",
-                        "options": {
-                            "request_timeout_ms": 1_000,
-                            "high_water_mark": 16,
-                            "max_message_bytes": 262_144,
-                        },
-                    }
-                },
-            },
-        }
-        phase = "client_config_parse"
-        parsed_config = parse_client_config(raw_config)
-        phase = "runtime_construct"
-        runtime = ServiceClientRuntime(
-            parsed_config,
-            identity=client,
-            scope_resolver=lambda scope_ref: {
-                account_scope_ref: account_scope,
-                market_scope_ref: market_scope,
-            }[scope_ref],
-            peer_resolver=lambda requested_service_id: (
-                peer if requested_service_id == service_id else None
-            ),
-            transport_factory=lambda _profile, _peer: transport,
-            run_id=f"source-fake-run-{suffix}",
-            requested_operations={
-                "store.account": _SERVICE_ACCOUNT_OPERATIONS,
-                "store.market": _SERVICE_MARKET_OPERATIONS,
-            },
-        )
-        phase = "runtime_start"
-        runtime.start()
-        phase = "account_facade_construct"
-        account_client = ServiceAccountClient(
-            runtime,
-            "store.account",
-            account_ref=account_ref,
-            expected_account=account_key,
-            required_coverage=(resource,),
-            require_open_orders=True,
-        )
-        subscriber = _SourceFakeEventSubscriber(
-            close_failures=subscriber_close_failures
-        )
-        phase = "market_facade_construct"
-        market_client = ServiceMarketClient(
-            runtime,
-            "store.market",
-            market_key,
-            subscriber_factory=lambda _binding, _scope: subscriber,
-            stream_scope=WireScope(_DOMAIN_REF),
-            head_check_interval_seconds=60.0,
-        )
-        phase = "read_proxy_construct"
-        proxy = ServiceReadProxy(
-            account_client,
-            {
-                _DATA_NAME: ServiceFeedBinding(
-                    market_client=market_client,
-                    resource=resource,
-                    qty_unit="base_units",
-                    timeframe="1m",
-                    history_start_utc=_BAR_OPEN,
-                    history_end_utc=_BAR_CLOSE,
-                )
-            },
-            valuation_currency="USD",
-            position_mode="net",
-            clock=lambda: datetime(2026, 10, 1, 12, 2, tzinfo=timezone.utc),
-        )
-    except BaseException as error:
-        exception_type = type(error).__name__
-        if exception_type not in _SAFE_SETUP_EXCEPTION_TYPES:
-            exception_type = "other_exception"
-        raw_code = getattr(error, "code", None)
-        safe_code = raw_code if type(raw_code) is str and raw_code in _SAFE_SETUP_ERROR_CODES else "unlisted_code"
-        resources = {
-            "runtime": runtime,
-            "account_client": account_client,
-            "market_client": market_client,
-            "proxy": proxy,
-            "subscriber": subscriber,
-            "transport": transport,
-            "service": service,
-            "registry": registry,
-        }
-        cleanup_state = (
-            "resources_closed"
-            if _RETAINED_RESOURCE_OWNER.close_resources(resources)
-            else "resources_retained"
-        )
-        _SETUP_DIAGNOSTICS[environment] = (
-            phase,
-            exception_type,
-            safe_code,
-            cleanup_state,
-        )
-        raise
+        },
+    }
+    parsed_config = parse_client_config(raw_config)
+    subscriber = _SourceFakeEventSubscriber(close_failures=subscriber_close_failures)
+    transport_factory_calls = []
 
+    def transport_factory(profile, selected_peer):
+        transport_factory_calls.append((profile, selected_peer))
+        return transport
+
+    clock = lambda: datetime(2026, 10, 1, 12, 2, tzinfo=timezone.utc)
+    references = SdkRouteReferencesV2(
+        strategy=SdkRouteReference(route.references.strategy, sdk_strategy_ref),
+        provider=SdkRouteReference(route.references.provider, "synthetic"),
+        endpoint=SdkRouteReference(route.references.endpoint, transport_ref),
+        account=SdkRouteReference(route.references.account, account_ref),
+        credential=SdkRouteReference(route.references.credential, "source-fake-keys"),
+        scope=SdkRouteReference(route.references.scope, account_scope_ref),
+        product=SdkRouteReference(route.references.product, instrument.product_type),
+        data_source=SdkRouteReference(route.references.data_source, market_key.source_ref),
+        clock=SdkRouteReference(route.references.clock, "synthetic-clock/exchange-utc"),
+    )
+    spec = SdkReadOnlySpecV2(
+        route=route,
+        references=references,
+        environment=SdkEnvironmentMapping(route.environment, suffix),
+        client_config=parsed_config,
+        identity=client,
+        peer=peer,
+        client_principal_ref=client.principal_ref,
+        service_principal_ref=peer.principal_ref,
+        account_key=account_key,
+        account_resource=resource,
+        instrument=instrument,
+        subscription_key=market_key,
+        account_scope=account_scope,
+        market_scope=market_scope,
+        stream_scope=stream_scope,
+        account_ref=account_ref,
+        service_id=service_id,
+        instance_id=instance_id,
+        account_scope_ref=account_scope_ref,
+        market_scope_ref=market_scope_ref,
+        transport_ref=transport_ref,
+        security_profile_ref="source-fake-keys",
+        rpc_endpoint="tcp://127.0.0.1:1",
+        market_endpoint="tcp://127.0.0.1:2",
+        venue="source-fake",
+        product_type=instrument.product_type,
+        data_source_ref=market_key.source_ref,
+        entitlement_ref=market_key.entitlement_ref,
+        scope_context_field=scope_context_field,
+        scope_context_ref=_DOMAIN_REF,
+        clock_binding=SdkClockBinding("synthetic-clock/exchange-utc", clock),
+        data_name=_DATA_NAME,
+        history_start_utc=_BAR_OPEN,
+        history_end_utc=_BAR_CLOSE,
+        valuation_currency="USD",
+        position_mode="net",
+        qty_unit="base_units",
+        transport_factory=transport_factory,
+        subscriber_factory=lambda _binding, _scope: subscriber,
+    )
+    factory = SdkReadOnlyFacadeFactory(spec)
     return {
-        "runtime": runtime,
-        "account_client": account_client,
-        "market_client": market_client,
-        "proxy": proxy,
-        "subscriber": subscriber,
-        "transport": transport,
+        "factory": factory,
+        "owner": factory.owner,
+        "spec": spec,
         "service": service,
         "registry": registry,
+        "transport": transport,
+        "transport_factory_calls": transport_factory_calls,
+        "subscriber": subscriber,
     }
 
 
@@ -763,13 +714,12 @@ def _runtime_bindings(tmp_path, stacks):
         for environment in (Environment.PAPER, Environment.LIVE)
     }
 
-    def provider_factory(environment):
-        def create():
-            stack = _make_stack(environment, tmp_path)
-            stacks[environment] = stack
-            return stack["proxy"]
-
-        return create
+    for environment in (Environment.PAPER, Environment.LIVE):
+        stacks[environment] = _make_stack(
+            environment,
+            tmp_path,
+            route=routes[environment],
+        )
 
     contract_registry = TrustedRegistryV2(
         (routes[Environment.PAPER], routes[Environment.LIVE])
@@ -781,7 +731,7 @@ def _runtime_bindings(tmp_path, stacks):
                 routes[environment],
                 _SameStrategy,
                 (FeedSpec(_DATA_NAME),),
-                provider_factory(environment),
+                stacks[environment]["factory"],
             )
             for environment in (Environment.PAPER, Environment.LIVE)
         ),
@@ -791,7 +741,6 @@ def _runtime_bindings(tmp_path, stacks):
 
 def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(tmp_path):
     _SETUP_DIAGNOSTICS.clear()
-    assert _RETAINED_RESOURCE_OWNER.retained == ()
     stacks = {}
     bindings, routes = _runtime_bindings(tmp_path, stacks)
     outcomes = []
@@ -814,7 +763,10 @@ def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(tm
                     ) from None
                 raise
 
-            def request_stop_at_deadline():
+            def request_stop_at_deadline(
+                stop_requested=stop_requested,
+                session=session,
+            ):
                 stop_requested.set()
                 session.request_stop()
 
@@ -825,13 +777,14 @@ def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(tm
             # RunSession.run returns only after its real Store/proxy shutdown checks.
             assert stop_requested.is_set() is False
             stack = stacks[environment]
+            owner = stack["owner"]
             assert session._store._service_read_only_stopped is True
-            assert stack["proxy"].is_connected is False
+            assert owner.proxy.is_connected is False
             normal_proxy_close_confirmed = True
-            assert type(stack["runtime"]) is ServiceClientRuntime
-            assert type(stack["account_client"]) is ServiceAccountClient
-            assert type(stack["market_client"]) is ServiceMarketClient
-            assert type(stack["proxy"]) is ServiceReadProxy
+            assert type(owner.runtime) is ServiceClientRuntime
+            assert type(owner.account_client) is ServiceAccountClient
+            assert type(owner.market_client) is ServiceMarketClient
+            assert type(owner.proxy) is ServiceReadProxy
             assert type(strategy) is _SameStrategy
             assert type(strategy.env) is Cerebro
             assert type(strategy.datas[0]) is BtApiFeed
@@ -852,11 +805,11 @@ def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(tm
                 "batch_cancel_rejected": 0,
                 "total_rejected": 1,
             }
-            assert stack["proxy"].is_connected is False
+            assert owner.proxy.is_connected is False
             assert stack["service"].market_registrations == set()
             assert stack["subscriber"].closed is True
             assert stack["transport"].closed is False
-            assert stack["runtime"].state == "registered"
+            assert owner.runtime.state == "registered"
             assert "account.snapshot" in stack["service"].operations
             assert "market.subscribe" in stack["service"].operations
             assert "market.history" in stack["service"].operations
@@ -881,61 +834,441 @@ def test_real_sdk_facades_run_same_strategy_in_paper_and_live_without_network(tm
                 if stack is not None and session is not None and not normal_proxy_close_confirmed:
                     try:
                         session.close()
-                    except Exception:
+                    except RuntimeAssemblyError as close_error:
                         # The explicit owner below retries the real facade and
                         # retains all resources if that close remains uncertain.
-                        pass
+                        assert close_error.code
                 if stack is not None:
-                    # The test owns the runtime, but only a normal session close
-                    # confirms the facade boundary without another proxy call.
-                    _RETAINED_RESOURCE_OWNER.close_resources(
-                        stack,
-                        facade_close_confirmed=normal_proxy_close_confirmed,
-                    )
+                    try:
+                        # RunSession closes the per-run proxy boundary but
+                        # borrows the factory-owned SDK runtime.
+                        stack["owner"].close()
+                    except SdkReadOnlyError:
+                        pass
+                    if stack["owner"].state == "closed":
+                        stack["registry"].close()
 
     assert outcomes == [
         (Environment.PAPER, _SameStrategy, ((True, 100.5),)),
         (Environment.LIVE, _SameStrategy, ((True, 100.5),)),
     ]
     assert type(outcomes[0][1]) is type(outcomes[1][1]) is type
-    assert _RETAINED_RESOURCE_OWNER.retained == ()
     for environment in (Environment.PAPER, Environment.LIVE):
         stack = stacks[environment]
-        assert stack["runtime"].state == "closed"
-        assert stack["runtime"].cleanup_failures == 0
-        assert stack["runtime"].unregister_uncertainties == 0
-        assert stack["runtime"].unknown_registration_count == 0
+        owner = stack["owner"]
+        assert owner.state == "closed"
+        assert owner.runtime.state == "closed"
+        assert owner.runtime.cleanup_failures == 0
+        assert owner.runtime.unregister_uncertainties == 0
+        assert owner.runtime.unknown_registration_count == 0
         assert stack["transport"].closed is True
         with pytest.raises(RuntimeError):
             stack["registry"].set_ready(True)
 
 
 def test_failed_proxy_close_is_retained_until_owner_retry(tmp_path):
-    assert _RETAINED_RESOURCE_OWNER.retained == ()
     stack = _make_stack(
         Environment.PAPER,
         tmp_path,
         subscriber_close_failures=1,
     )
-    stack["market_client"].start()
+    owner = stack["factory"].build()
+    owner.market_client.start()
     assert stack["service"].market_registrations
 
     # A false connection flag during ServiceReadProxy's closing state is not a
     # close receipt. The real proxy raised, so runtime and Registry stay owned.
-    assert _RETAINED_RESOURCE_OWNER.close_resources(stack) is False
-    assert _RETAINED_RESOURCE_OWNER.retained == (stack,)
-    assert stack["runtime"].state == "registered"
+    with pytest.raises(SdkReadOnlyError) as first_close:
+        owner.close()
+    assert first_close.value.code == "sdk_facade_close_failed"
+    assert owner.retained is True
+    assert owner.state == "close_failed"
+    assert owner.runtime.state == "registered"
     assert stack["registry"].ready is True
     assert stack["transport"].closed is False
     assert stack["subscriber"].close_calls == 1
     assert stack["subscriber"].closed is False
 
-    assert _RETAINED_RESOURCE_OWNER.retry_one() is True
-    assert _RETAINED_RESOURCE_OWNER.retained == ()
-    assert stack["proxy"].is_connected is False
-    assert stack["runtime"].state == "closed"
+    owner.close()
+    assert owner.retained is False
+    assert owner.state == "closed"
+    assert owner.proxy.is_connected is False
+    assert owner.runtime.state == "closed"
     assert stack["transport"].closed is True
     assert stack["subscriber"].close_calls == 2
     assert stack["subscriber"].closed is True
+    stack["registry"].close()
     with pytest.raises(RuntimeError):
         stack["registry"].set_ready(True)
+
+
+def test_factory_requires_sdk_market_source_descriptor(tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    owner = stack["factory"].build()
+    try:
+        owner.market_client.start()
+        descriptor = owner.market_client.source_descriptor
+        assert type(descriptor) is MarketSourceDescriptor
+        assert descriptor.key == owner.market_client.key
+        assert descriptor.source == "source-fake-provider-route"
+        assert descriptor.clock_domain_id == "source-fake-clock-domain"
+    finally:
+        owner.close()
+        stack["registry"].close()
+
+
+def test_route_mapping_mismatch_is_rejected_before_transport_factory_or_start(tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    spec = stack["spec"]
+    bad_provider_pair = replace(
+        spec.references.provider,
+        route_ref="provider/not-the-selected-route",
+    )
+    bad_spec = replace(
+        spec,
+        references=replace(spec.references, provider=bad_provider_pair),
+    )
+    factory = SdkReadOnlyFacadeFactory(bad_spec)
+
+    with pytest.raises(SdkReadOnlyError) as error:
+        factory.build()
+
+    assert error.value.code == "route_reference_mapping_mismatch"
+    assert error.value.__context__ is None
+    assert factory.owner.runtime is None
+    assert stack["transport_factory_calls"] == []
+    assert stack["transport"].operations == []
+    stack["registry"].close()
+
+
+def test_environment_mapping_mismatch_is_rejected_before_transport_factory(tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    bad_spec = replace(
+        stack["spec"],
+        environment=SdkEnvironmentMapping(Environment.PAPER, "live"),
+    )
+    factory = SdkReadOnlyFacadeFactory(bad_spec)
+
+    with pytest.raises(SdkReadOnlyError) as error:
+        factory.build()
+
+    assert error.value.code == "sdk_route_binding_mismatch"
+    assert error.value.__context__ is None
+    assert factory.owner.runtime is None
+    assert stack["transport_factory_calls"] == []
+    assert stack["transport"].operations == []
+    stack["registry"].close()
+
+
+def test_clock_reference_and_callable_mismatch_is_rejected_before_io(tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    spec = stack["spec"]
+    bad_spec = replace(
+        spec,
+        clock_binding=SdkClockBinding("another-clock", spec.clock_binding.read),
+    )
+    factory = SdkReadOnlyFacadeFactory(bad_spec)
+
+    with pytest.raises(SdkReadOnlyError) as error:
+        factory.build()
+
+    assert error.value.code == "sdk_route_binding_mismatch"
+    assert error.value.__context__ is None
+    assert factory.owner.runtime is None
+    assert stack["transport_factory_calls"] == []
+    assert stack["transport"].operations == []
+    stack["registry"].close()
+
+
+def test_scope_with_unmapped_run_dimension_is_rejected_before_io(tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    spec = stack["spec"]
+    bad_spec = replace(
+        spec,
+        market_scope=replace(spec.market_scope, run_id="unexpected-run"),
+    )
+    factory = SdkReadOnlyFacadeFactory(bad_spec)
+
+    with pytest.raises(SdkReadOnlyError) as error:
+        factory.build()
+
+    assert error.value.code == "sdk_scope_or_market_mapping_mismatch"
+    assert error.value.__context__ is None
+    assert factory.owner.runtime is None
+    assert stack["transport_factory_calls"] == []
+    assert stack["transport"].operations == []
+    stack["registry"].close()
+
+
+def test_assemble_run_preflights_factory_against_selected_route(tmp_path):
+    selected_route = _route(Environment.PAPER)
+    mismatched_stack = _make_stack(Environment.LIVE, tmp_path)
+    bindings = RuntimeBindingsV2(
+        TrustedRegistryV2((selected_route,)),
+        (
+            RouteBindingV2(
+                selected_route,
+                _SameStrategy,
+                (FeedSpec(_DATA_NAME),),
+                mismatched_stack["factory"],
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeAssemblyError) as error:
+        assemble_run(_run_config(selected_route), bindings)
+
+    assert error.value.code == "provider_binding_preflight_failed"
+    assert error.value.__context__ is None
+    assert mismatched_stack["owner"].runtime is None
+    assert mismatched_stack["transport_factory_calls"] == []
+    assert mismatched_stack["transport"].operations == []
+    mismatched_stack["registry"].close()
+
+
+def test_assemble_run_propagates_preflight_keyboard_interrupt(tmp_path):
+    route = _route(Environment.PAPER)
+    marker = KeyboardInterrupt("synthetic preflight interrupt")
+
+    class InterruptingFactory:
+        def __init__(self):
+            self.calls = 0
+
+        def preflight(self, selected_route):
+            assert selected_route == route
+            raise marker
+
+        def __call__(self):
+            self.calls += 1
+            raise AssertionError("provider factory ran after interrupted preflight")
+
+    factory = InterruptingFactory()
+    bindings = RuntimeBindingsV2(
+        TrustedRegistryV2((route,)),
+        (RouteBindingV2(route, _SameStrategy, (FeedSpec(_DATA_NAME),), factory),),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as error:
+        assemble_run(_run_config(route), bindings)
+
+    assert error.value is marker
+    assert error.value.__context__ is None
+    assert factory.calls == 0
+
+
+def test_sdk_factory_cleans_then_propagates_transport_keyboard_interrupt(tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    marker = KeyboardInterrupt("synthetic transport interrupt")
+
+    def interrupted_transport_factory(_profile, _peer):
+        raise marker
+
+    spec = replace(stack["spec"], transport_factory=interrupted_transport_factory)
+    factory = SdkReadOnlyFacadeFactory(spec)
+
+    with pytest.raises(KeyboardInterrupt) as error:
+        factory.build()
+
+    assert error.value is marker
+    assert error.value.__context__ is None
+    assert factory.owner.state == "closed"
+    assert factory.owner.retained is False
+    assert factory.owner.runtime.state == "closed"
+    assert factory.owner.runtime.cleanup_failures == 0
+    assert factory.owner.runtime.unregister_uncertainties == 0
+    assert factory.owner.runtime.unknown_registration_count == 0
+    assert stack["transport_factory_calls"] == []
+    assert stack["transport"].operations == []
+    stack["registry"].close()
+
+
+def test_sdk_mapping_repr_redacts_refs_endpoints_and_factory_objects(tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    spec = stack["spec"]
+    joined = " ".join(
+        (
+            repr(spec),
+            repr(spec.references),
+            repr(spec.references.credential),
+            repr(spec.environment),
+            repr(spec.clock_binding),
+        )
+    )
+    for private_marker in (
+        "source-fake-keys",
+        "synthetic-account-paper",
+        "tcp://127.0.0.1:1",
+        "synthetic-clock/exchange-utc",
+    ):
+        assert private_marker not in joined
+    stack["registry"].close()
+
+
+def _assert_ambient_exception_is_suppressed(error, *private_markers):
+    assert error.__suppress_context__ is True
+    rendered = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    for marker in private_markers:
+        assert marker not in rendered
+
+
+def test_sdk_import_boundary_suppresses_ambient_exception(monkeypatch, tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+    original_import = builtins.__import__
+
+    def fail_runtime_import(name, *args, **kwargs):
+        if name == "bt_api_py.service_runtime":
+            raise ImportError("sdk-import-private-token")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_runtime_import)
+    try:
+        raise RuntimeError("ambient-private-token")
+    except RuntimeError:
+        with pytest.raises(SdkReadOnlyError) as error:
+            stack["factory"].preflight(stack["spec"].route)
+
+    assert error.value.code == "sdk_read_dependencies_unavailable"
+    _assert_ambient_exception_is_suppressed(
+        error.value,
+        "ambient-private-token",
+        "sdk-import-private-token",
+    )
+    assert stack["factory"].owner.runtime is None
+    assert stack["transport_factory_calls"] == []
+    stack["registry"].close()
+
+
+def test_sdk_config_boundary_suppresses_ambient_exception(monkeypatch, tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+
+    def fail_public_projection(_config):
+        raise ValueError("config-private-token")
+
+    monkeypatch.setattr(
+        type(stack["spec"].client_config),
+        "to_public_dict",
+        fail_public_projection,
+    )
+    try:
+        raise RuntimeError("ambient-private-token")
+    except RuntimeError:
+        with pytest.raises(SdkReadOnlyError) as error:
+            stack["factory"].preflight(stack["spec"].route)
+
+    assert error.value.code == "client_config_unreadable"
+    _assert_ambient_exception_is_suppressed(
+        error.value,
+        "ambient-private-token",
+        "config-private-token",
+    )
+    assert stack["factory"].owner.runtime is None
+    assert stack["transport_factory_calls"] == []
+    stack["registry"].close()
+
+
+def test_sdk_build_boundary_suppresses_ambient_exception(tmp_path):
+    stack = _make_stack(Environment.PAPER, tmp_path)
+
+    def fail_transport_factory(_profile, _peer):
+        raise RuntimeError("transport-private-token")
+
+    factory = SdkReadOnlyFacadeFactory(
+        replace(stack["spec"], transport_factory=fail_transport_factory)
+    )
+    try:
+        raise RuntimeError("ambient-private-token")
+    except RuntimeError:
+        with pytest.raises(SdkReadOnlyError) as error:
+            factory.build()
+
+    assert error.value.code == "sdk_facade_construction_failed"
+    _assert_ambient_exception_is_suppressed(
+        error.value,
+        "ambient-private-token",
+        "transport-private-token",
+    )
+    assert factory.owner.state == "closed"
+    assert factory.owner.runtime.cleanup_failures == 0
+    assert factory.owner.runtime.unregister_uncertainties == 0
+    assert factory.owner.runtime.unknown_registration_count == 0
+    stack["registry"].close()
+
+
+@pytest.mark.parametrize("failure_phase", ("preflight", "provider_factory"))
+def test_assembly_boundary_suppresses_ambient_exception(failure_phase):
+    route = _route(Environment.PAPER)
+
+    class FailingFactory:
+        def preflight(self, selected_route):
+            assert selected_route == route
+            if failure_phase == "preflight":
+                raise RuntimeError("preflight-private-token")
+            return True
+
+        def __call__(self):
+            raise RuntimeError("factory-private-token")
+
+    bindings = RuntimeBindingsV2(
+        TrustedRegistryV2((route,)),
+        (
+            RouteBindingV2(
+                route,
+                _SameStrategy,
+                (FeedSpec(_DATA_NAME),),
+                FailingFactory(),
+            ),
+        ),
+    )
+    try:
+        raise RuntimeError("ambient-private-token")
+    except RuntimeError:
+        with pytest.raises(RuntimeAssemblyError) as error:
+            assemble_run(_run_config(route), bindings)
+
+    expected_code = (
+        "provider_binding_preflight_failed"
+        if failure_phase == "preflight"
+        else "provider_factory_failed"
+    )
+    private_marker = (
+        "preflight-private-token"
+        if failure_phase == "preflight"
+        else "factory-private-token"
+    )
+    assert error.value.code == expected_code
+    _assert_ambient_exception_is_suppressed(
+        error.value,
+        "ambient-private-token",
+        private_marker,
+    )
+
+
+def test_remote_unregister_uncertainty_keeps_owner_unconfirmed(tmp_path):
+    stack = _make_stack(
+        Environment.PAPER,
+        tmp_path,
+        drop_unregister_response=True,
+    )
+    owner = stack["factory"].build()
+
+    with pytest.raises(SdkReadOnlyError) as first_close:
+        owner.close()
+
+    assert first_close.value.code == "sdk_runtime_cleanup_unconfirmed"
+    assert owner.retained is True
+    assert owner.runtime.state == "closed"
+    assert owner.runtime.cleanup_failures > 0
+    assert owner.runtime.unregister_uncertainties > 0
+    assert owner.runtime.unknown_registration_count == 0
+    assert stack["transport"].closed is True
+
+    # The owner retains the whole group, but does not claim a retry can recover
+    # a remote result after the SDK has already closed its transport.
+    with pytest.raises(SdkReadOnlyError) as retry:
+        owner.close()
+    assert retry.value.code == "sdk_remote_registration_uncertain"
+    assert owner.retained is True
+    assert owner.state == "remote_uncertain"
+    stack["registry"].close()

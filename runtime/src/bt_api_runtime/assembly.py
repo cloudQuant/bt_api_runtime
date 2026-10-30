@@ -390,15 +390,18 @@ def _select_binding_v2(
 
 
 class RunSession:
-    """Single-use assembled run with explicit resource ownership.
+    """Single-use assembled run with an owner-thread proxy lifecycle.
 
-    The session owns its ``ServiceReadProxy`` and the account/market facades
-    injected into that proxy. It borrows any shared SDK runtime behind those
-    facades. Cerebro owns normal component start/stop. If startup fails before
-    Cerebro enters its cleanup block, this session best-effort stops the actual
-    Broker, Feed/Data, Store, and proxy on the construction/run owner thread.
-    It does not wrap Strategy lifecycle hooks, so Strategy constructors and
-    ``start()`` must not leave external resources behind when they raise.
+    Cerebro owns normal component start/stop. The session drives the per-run
+    ``ServiceReadProxy`` close boundary and never closes an SDK runtime. With a
+    :class:`SdkReadOnlyFacadeFactory`, the factory's resource owner retains the
+    proxy, account/market facades, and SDK runtime; after the session returns,
+    the application calls that owner's ``close()`` to finish runtime cleanup.
+    If startup fails before Cerebro enters its cleanup block, this session
+    best-effort stops the actual Broker, Feed/Data, Store, and proxy on the
+    construction/run owner thread. It does not wrap Strategy lifecycle hooks,
+    so Strategy constructors and ``start()`` must not leave external resources
+    behind when they raise.
     """
 
     __slots__ = (
@@ -656,16 +659,36 @@ def assemble_run(
             raise RuntimeAssemblyError("invalid_strategy_parameters")
     else:  # parse_config currently returns only these two exact DTO types.
         raise RuntimeAssemblyError("unsupported_config_version")
+    # Provider factories that expose a public preflight hook can bind their
+    # route/config map to the exact route selected above. This hook runs before
+    # the factory itself, so the SDK-owned factory can reject a mismatched
+    # symbolic route before transport or registration starts. Legacy factories
+    # without the hook retain their zero-argument contract and do not receive
+    # this preflight guarantee. In either case this is consistency checking,
+    # not provider identity or authorization.
+    preflight = getattr(binding.provider_factory, "preflight", None)
+    if callable(preflight):
+        preflight_failed = False
+        preflight_result = None
+        try:
+            preflight_result = preflight(binding.route)
+        except Exception:  # noqa: BLE001 - expose only the finite preflight boundary code
+            preflight_failed = True
+        if preflight_failed or preflight_result is not True:
+            raise RuntimeAssemblyError("provider_binding_preflight_failed") from None
     if not callable(getattr(ServiceReadProxy, "supports_bar_history", None)):
         raise RuntimeAssemblyError("backtrader_bar_history_capability_unavailable")
 
+    provider_factory_failed = False
+    proxy = None
     try:
         proxy = binding.provider_factory()
     except Exception:  # noqa: BLE001 - avoid propagating provider details through this boundary
+        provider_factory_failed = True
+    if provider_factory_failed:
         raise RuntimeAssemblyError("provider_factory_failed") from None
     if type(proxy) is not ServiceReadProxy:
-        raise RuntimeAssemblyError("provider_factory_returned_unsupported_client")
-
+        raise RuntimeAssemblyError("provider_factory_returned_unsupported_client") from None
     try:
         if (
             getattr(proxy, "service_read_only", None) is not True
