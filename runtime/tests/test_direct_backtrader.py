@@ -34,6 +34,7 @@ def _plan(
         "account.read",
         "orders.paper.write",
     ),
+    plugins: str = "  runtime: false",
 ):
     lines = [
         "schema_version: 2",
@@ -50,7 +51,7 @@ def _plan(
         "  data_source: data_source/binance_demo",
         "  clock: clock/exchange_utc",
         "plugins:",
-        "  runtime: false",
+        plugins,
         "strategy_parameters:",
         "  symbol: BTCUSDT",
         "requested_capabilities:",
@@ -314,6 +315,12 @@ def test_direct_session_rejects_cross_environment_profile_at_construction():
 def test_direct_session_rejects_plan_provider_mismatch():
     with pytest.raises(DirectSessionError, match="plan_provider_mismatch"):
         _session(profile=_profile(provider_ref="provider/other"))
+
+
+def test_direct_session_rejects_enabled_plugins():
+    plan = _plan(plugins="  runtime: false\n  risk: true")
+    with pytest.raises(DirectSessionError, match="plugin_composition_unavailable"):
+        _session(plan=plan)
 
 
 def test_direct_session_requires_write_capability_in_plan():

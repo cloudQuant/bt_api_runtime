@@ -27,7 +27,7 @@ references, static capability declaration, and strategy-parameter contract to
 one code-owned strategy class, feed set, and provider factory before invoking
 that factory.
 
-The current source candidate is version 0.1.14 and pins the contract package
+The current source candidate is version 0.1.15 and pins the contract package
 at `bt-api-run-contract==0.1.5`. It includes an optional
 lazy-imported SDK read-only facade factory and resource owner; the Python 3.11+
 SDK remains absent from the runtime's required dependencies so ordinary
@@ -225,6 +225,12 @@ Both commands parse only the schema-v2 user configuration and never import
 Backtrader, SDK services or provider modules, read credentials, or use the
 network; enabled plugins are reported as blocked.  A passing check is a
 diagnostic, not a run mode or write authorization.
+
+Version `0.1.15` makes the direct Backtrader session reject any enabled plugin
+name before touching provider credentials or transport.  The CLI already
+reported that state as blocked; the session now applies the same fail-closed
+rule, so a configuration that selects a plugin can never fall back to the
+plain direct composition.  Disabled plugin entries remain accepted.
 
 Version `0.1.13` adds the optional lazy `direct_backtrader` module: one
 config-driven direct Backtrader paper/live session built from a code-owned

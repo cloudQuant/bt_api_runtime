@@ -411,6 +411,9 @@ class DirectBacktraderSession:
             raise DirectSessionError("paper_provider_environment_mismatch")
         if profile.environment != "production" and plan.mode is RunMode.LIVE:
             raise DirectSessionError("live_provider_environment_mismatch")
+        enabled_plugins = tuple(name for name, enabled in plan.plugins if enabled)
+        if enabled_plugins:
+            raise DirectSessionError("plugin_composition_unavailable")
         declared = frozenset(plan.requested_capabilities)
         if not _REQUIRED_READ_CAPABILITIES <= declared:
             raise DirectSessionError("read_capability_not_requested")
