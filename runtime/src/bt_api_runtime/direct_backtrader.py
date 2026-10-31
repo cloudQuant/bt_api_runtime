@@ -622,7 +622,7 @@ class DirectBacktraderSession:
                 deadline,
                 lambda: getattr(cerebro, "runstop", None),
             )
-            idle_pump = _IdlePump(cerebro, on_idle=self._pump_recovery)
+            idle_pump = _IdlePump(cerebro, on_idle=self._pump_maintenance)
             timer.start()
             idle_pump.start()
             try:
@@ -767,6 +767,16 @@ class DirectBacktraderSession:
             state["store_connected"] = bool(getattr(self._store, "is_connected", False))
         self._closed = True
         return state
+
+    def _pump_maintenance(self) -> None:
+        store = self._store
+        poll = getattr(store, "poll_execution_maintenance", None) if store is not None else None
+        if callable(poll):
+            try:
+                poll()
+            except Exception:  # noqa: BLE001 - bounded maintenance
+                pass
+        self._pump_recovery()
 
     def _pump_recovery(self) -> None:
         if self._provider_query is None:
