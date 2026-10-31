@@ -27,7 +27,7 @@ references, static capability declaration, and strategy-parameter contract to
 one code-owned strategy class, feed set, and provider factory before invoking
 that factory.
 
-The current source candidate is version 0.1.16 and pins the contract package
+The current source candidate is version 0.1.17 and pins the contract package
 at `bt-api-run-contract==0.1.5`. It includes an optional
 lazy-imported SDK read-only facade factory and resource owner; the Python 3.11+
 SDK remains absent from the runtime's required dependencies so ordinary
@@ -239,6 +239,20 @@ demotes a finished run to `PARTIAL`/`shutdown_incomplete`, and the deadline
 thread records expiry in the shutdown facts (its stop callback no longer
 shares the reserved `Thread._stop` name).  These are source/fake lifecycle
 contracts only.
+
+Version `0.1.17` adds the public `paper_composition` module: the venue-agnostic
+credential-variable loader, bounded write-grant builder, evidence JSON writer
+and compact stdout summary relocated from example-local helper copies.  The two
+numeric grant limits are now explicit required arguments rather than
+example-specific parameter names, and the evidence destination directory and
+file-name slug are caller-supplied instead of hard-coded to one example.  The
+writer creates the directory, serializes before an exclusive create so a failed
+payload leaves no artifact, and never overwrites an existing evidence file.
+`allow_live_write` stays pinned `False` and the real `DirectWriteGrant`
+validation is unchanged, so a grant built here still cannot authorize a live
+write.  This module imports only the standard library at module scope, so the
+package root remains lazy.  These are source and test-tier contracts only; no
+provider, account, network or installed-wheel acceptance is implied.
 
 Version `0.1.13` adds the optional lazy `direct_backtrader` module: one
 config-driven direct Backtrader paper/live session built from a code-owned

@@ -171,7 +171,7 @@ def _doctor(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bt-api-runtime", description=__doc__)
-    parser.add_argument("--version", action="version", version="bt-api-runtime 0.1.16")
+    parser.add_argument("--version", action="version", version="bt-api-runtime 0.1.17")
     subparsers = parser.add_subparsers(dest="command", required=True)
     validate = subparsers.add_parser("validate", help="validate the unified config offline")
     validate.add_argument("--config", required=True)

@@ -53,6 +53,16 @@ for _module_name, _names in (
             "DirectWriteGrant",
         ),
     ),
+    (
+        ".paper_composition",
+        (
+            "PaperCompositionError",
+            "build_grant",
+            "load_credentials",
+            "summarize",
+            "write_evidence",
+        ),
+    ),
 ):
     for _name in _names:
         _MODULE_BY_NAME[_name] = _module_name
