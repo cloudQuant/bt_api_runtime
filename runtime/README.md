@@ -27,7 +27,7 @@ references, static capability declaration, and strategy-parameter contract to
 one code-owned strategy class, feed set, and provider factory before invoking
 that factory.
 
-The current source candidate is version 0.1.12 and pins the contract package
+The current source candidate is version 0.1.13 and pins the contract package
 at `bt-api-run-contract==0.1.5`. It includes an optional
 lazy-imported SDK read-only facade factory and resource owner; the Python 3.11+
 SDK remains absent from the runtime's required dependencies so ordinary
@@ -219,6 +219,17 @@ Version `0.1.12` adds the explicit dual-host target bundle while retaining the
 source/fake coverage uses the real SDK runtime and facades with synthetic
 registries and transport/subscriber leaves; it is not real-account or provider
 acceptance.
+
+Version `0.1.13` adds the optional lazy `direct_backtrader` module: one
+config-driven direct Backtrader paper/live session built from a code-owned
+provider profile, injected credential values and a bounded write grant. It
+reuses the real `BtApiStore`/`BtApiBroker` execution chain, keeps the base
+package free of Backtrader imports, and adds a bounded idle pump for live feeds
+that block the engine maintenance loop. A Binance USD-M Demo paper-account
+round trip (one LIMIT order, submit receipt, accepted, strategy-requested
+cancel, terminal canceled, flat shutdown) was accepted on 2026-10-31 through
+the new entry; that is one venue and does not establish OKX/SimNow, installed
+wheel, production-write or general provider acceptance.
 
 The session is bound to the thread that assembled it. `run()` and `close()`
 must use that owner thread because the proxy is thread-bound. Any thread may
