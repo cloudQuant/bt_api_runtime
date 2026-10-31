@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -92,7 +93,10 @@ class DirectProviderProfile:
     position_mode: str = "dual_side"
     require_account_risk: bool = True
     account_maximum_loss_bps: str = "50"
-    account_risk_max_age_seconds: str = "30"
+    account_risk_max_age_seconds: str = "60"
+    reconcile_attempts: int = 6
+    reconcile_backoff_seconds: float = 0.5
+    cancel_confirmation_timeout_seconds: float = 5.0
     supports_write: bool = True
     data_timeframe: str = "ticks"
     readiness_quantity: float = 1.0
@@ -139,6 +143,11 @@ class DirectProviderProfile:
             raise DirectSessionError("invalid_risk_max_age") from exc
         if not (0 < risk_age <= 300):
             raise DirectSessionError("invalid_risk_max_age")
+        _require_positive_int(self.reconcile_attempts, "invalid_reconcile_attempts")
+        _require_positive_float(self.reconcile_backoff_seconds, "invalid_reconcile_backoff")
+        _require_positive_float(
+            self.cancel_confirmation_timeout_seconds, "invalid_cancel_confirmation_timeout"
+        )
         if type(self.require_account_risk) is not bool:
             raise DirectSessionError("invalid_risk_requirement")
         if type(self.supports_write) is not bool:
@@ -246,6 +255,7 @@ class DirectSessionReport:
     shutdown: Mapping[str, Any]
     config_sha256: str
     strategy_facts: Mapping[str, Any] = field(default_factory=dict)
+    failure_detail: str = ""
     cleanup_steps: tuple[str, ...] = ()
 
     def to_json(self) -> dict[str, Any]:
@@ -266,8 +276,18 @@ class DirectSessionReport:
             "shutdown": _json_safe(self.shutdown),
             "config_sha256": self.config_sha256,
             "strategy_facts": _json_safe(self.strategy_facts),
+            "failure_detail": self.failure_detail,
             "cleanup_steps": list(self.cleanup_steps),
         }
+
+
+def _bounded_exception_text(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    text = str(code) if isinstance(code, str) and code else str(exc)
+    cleaned = "".join(
+        char for char in text[:160] if char.isascii() and (char.isalnum() or char in " _.-:/")
+    ).strip()
+    return cleaned
 
 
 def _json_safe(value: Any) -> Any:
@@ -350,6 +370,7 @@ class DirectBacktraderSession:
         store_factory: Callable[..., Any] | None = None,
         broker_factory: Callable[..., Any] | None = None,
         cerebro_factory: Callable[..., Any] | None = None,
+        provider_query: Callable[[str, Any], Any] | None = None,
         clock: Callable[[], datetime] | None = None,
         initialize_risk_baseline: bool = False,
     ) -> None:
@@ -377,6 +398,7 @@ class DirectBacktraderSession:
         self._store_factory = store_factory
         self._broker_factory = broker_factory
         self._cerebro_factory = cerebro_factory
+        self._provider_query = provider_query
         self._initialize_risk_baseline = bool(initialize_risk_baseline)
         self._store: Any = None
         self._broker: Any = None
@@ -404,6 +426,13 @@ class DirectBacktraderSession:
             if profile_ref != plan_ref:
                 raise DirectSessionError(code)
 
+    def set_provider_query(self, provider_query: Callable[[str, Any], Any]) -> None:
+        if not callable(provider_query):
+            raise DirectSessionError("invalid_provider_query")
+        if self._closed:
+            raise DirectSessionError("session_closed")
+        self._provider_query = provider_query
+
     @property
     def store(self) -> Any:
         return self._store
@@ -429,6 +458,7 @@ class DirectBacktraderSession:
             "account_maximum_loss_bps": self._profile.account_maximum_loss_bps,
             "account_risk_max_age_seconds": self._profile.account_risk_max_age_seconds,
             "require_account_risk": required_risk,
+            "order_poll_interval": 0.2,
         }
         config.update(dict(self._profile.extra_store_config))
         return config
@@ -470,6 +500,18 @@ class DirectBacktraderSession:
             remote_mode = account.get("position_mode")
             if remote_mode is not None and remote_mode != self._profile.position_mode:
                 raise DirectSessionError("position_mode_mismatch")
+            get_spec = getattr(self._store, "get_instrument_spec", None)
+            if not callable(get_spec):
+                raise DirectSessionError("instrument_spec_unavailable")
+            spec = get_spec(symbol)
+            if not isinstance(spec, Mapping):
+                raise DirectSessionError("instrument_spec_unavailable")
+            try:
+                multiplier = float(spec.get("multiplier"))
+            except (TypeError, ValueError) as exc:
+                raise DirectSessionError("instrument_multiplier_invalid") from exc
+            if not math.isfinite(multiplier) or multiplier <= 0:
+                raise DirectSessionError("instrument_multiplier_invalid")
             readiness = self._store.get_order_readiness(
                 symbol,
                 self._profile.readiness_quantity,
@@ -482,6 +524,7 @@ class DirectBacktraderSession:
                 "can_trade": account.get("can_trade"),
                 "position_mode": remote_mode,
                 "order_ready": readiness.get("ready"),
+                "multiplier": multiplier,
             }
         return facts
 
@@ -497,15 +540,42 @@ class DirectBacktraderSession:
             self._store = store
             self._store_started = True
             self._store_was_started = True
+            reconcile_facts = self._reconcile()
             if self._initialize_risk_baseline:
                 initialize = getattr(store, "initialize_account_risk_baseline", None)
                 if not callable(initialize):
                     raise DirectSessionError("risk_baseline_initializer_unavailable")
                 initialize()
-            return self._readiness()
+            return {"symbols": self._readiness(), "reconcile": reconcile_facts}
         except Exception:
             self._close_store()
             raise
+
+    def _reconcile(self) -> dict[str, Any]:
+        get_reconcile = getattr(self._store, "get_reconcile_snapshot", None)
+        if not callable(get_reconcile):
+            raise DirectSessionError("reconcile_snapshot_unavailable")
+        try:
+            snapshot = get_reconcile()
+        except Exception as exc:  # noqa: BLE001 - provider detail stays bounded
+            raise DirectSessionError("reconcile_snapshot_unavailable") from exc
+        if not isinstance(snapshot, Mapping):
+            raise DirectSessionError("reconcile_snapshot_invalid")
+        positions = snapshot.get("positions") or ()
+        open_orders = snapshot.get("open_orders") or ()
+        summary = snapshot.get("execution_summary") or {}
+        unknown_ids = summary.get("unknown_ids") or () if isinstance(summary, Mapping) else ()
+        active_orders = summary.get("active_orders") if isinstance(summary, Mapping) else None
+        if positions or open_orders or unknown_ids:
+            raise DirectSessionError("reconcile_exposure_present")
+        if isinstance(active_orders, int) and active_orders > 0:
+            raise DirectSessionError("reconcile_active_orders_present")
+        return {
+            "positions": len(positions),
+            "open_orders": len(open_orders),
+            "unknown_ids": len(unknown_ids),
+            "active_orders": active_orders,
+        }
 
     def run(
         self,
@@ -529,6 +599,7 @@ class DirectBacktraderSession:
         cerebro = None
         timer = None
         strategy_facts: dict[str, Any] = {}
+        failure_detail = ""
         try:
             _validate_grant(
                 self._grant,
@@ -551,7 +622,7 @@ class DirectBacktraderSession:
                 deadline,
                 lambda: getattr(cerebro, "runstop", None),
             )
-            idle_pump = _IdlePump(cerebro)
+            idle_pump = _IdlePump(cerebro, on_idle=self._pump_recovery)
             timer.start()
             idle_pump.start()
             try:
@@ -567,10 +638,14 @@ class DirectBacktraderSession:
             code = exc.code
         except Exception as exc:  # noqa: BLE001 - finite code, no provider details
             code = "session_failure_" + type(exc).__name__[:40].lower()
+            failure_detail = _bounded_exception_text(exc)
         finally:
             if timer is not None:
                 timer.cancel()
             shutdown = self._shutdown(cleanup_steps)
+            post_facts = self._execution_facts()
+            if post_facts:
+                shutdown["post_execution_summary"] = post_facts
         return DirectSessionReport(
             status=status,
             code=code,
@@ -588,6 +663,7 @@ class DirectBacktraderSession:
             shutdown=shutdown,
             config_sha256=self.config_sha256(),
             strategy_facts=strategy_facts,
+            failure_detail=failure_detail,
             cleanup_steps=tuple(cleanup_steps),
         )
 
@@ -601,6 +677,9 @@ class DirectBacktraderSession:
             "shutdown_timeout": 30.0,
             "approval_expires_at_utc": self._grant.expires_at_utc,
             "approval_max_order_count": self._grant.max_order_count,
+            "reconcile_retry_max_attempts": self._profile.reconcile_attempts,
+            "reconcile_retry_backoff": self._profile.reconcile_backoff_seconds,
+            "cancel_confirmation_timeout": self._profile.cancel_confirmation_timeout_seconds,
         }
         if self._broker_factory is not None:
             return self._broker_factory(store=self._store, profile=self._profile, **kwargs)
@@ -664,6 +743,9 @@ class DirectBacktraderSession:
 
     def _shutdown(self, steps: list[str]) -> dict[str, Any]:
         state: dict[str, Any] = {}
+        recovery = self._recover_unknown_orders()
+        if recovery is not None:
+            state["unknown_recovery"] = recovery
         if self._broker is not None:
             stop = getattr(self._broker, "stop", None)
             if callable(stop):
@@ -685,6 +767,93 @@ class DirectBacktraderSession:
             state["store_connected"] = bool(getattr(self._store, "is_connected", False))
         self._closed = True
         return state
+
+    def _pump_recovery(self) -> None:
+        if self._provider_query is None:
+            return
+        try:
+            self._recover_unknown_orders()
+        except Exception:  # noqa: BLE001 - idle maintenance must not stop the engine
+            return
+
+    def _recover_unknown_orders(self) -> dict[str, Any] | None:
+        """Resolve journal-unknown orders from provider truth before shutdown."""
+
+        if self._provider_query is None:
+            return None
+        store = self._store
+        api = getattr(store, "_api", None) if store is not None else None
+        if api is None:
+            ensure = getattr(store, "_ensure_api_ready", None) if store is not None else None
+            if callable(ensure):
+                try:
+                    api = ensure()
+                except Exception:  # noqa: BLE001
+                    api = None
+        if api is None:
+            return {"status": "unavailable", "reason": "execution_api_unavailable"}
+        summary = getattr(store, "get_execution_summary", None)
+        if not callable(summary):
+            return {"status": "unavailable", "reason": "execution_summary_unavailable"}
+        try:
+            unknown = list((summary() or {}).get("unknown_ids") or ())
+        except Exception:  # noqa: BLE001
+            return {"status": "unavailable", "reason": "execution_summary_unreadable"}
+        if not unknown:
+            return {"unknown_before": 0, "recovered": 0}
+        try:
+            from bt_api_py import QueryOrderRequest, reconcile_unknown_order_from_query
+        except Exception:  # noqa: BLE001
+            return {"unknown_before": len(unknown), "recovered": 0, "reason": "sdk_recovery_unavailable"}
+        orders = getattr(self._broker, "orders", None) if self._broker is not None else None
+        recovered = 0
+        failures: list[str] = []
+        for client_id in unknown:
+            order = None
+            for candidate in (orders or {}).values():
+                info = getattr(candidate, "info", {}) or {}
+                if str(info.get("client_order_id") or "") == str(client_id):
+                    order = candidate
+                    break
+            if order is None:
+                failures.append("journal_order_unavailable")
+                continue
+            info = getattr(order, "info", {}) or {}
+            external = str(info.get("external_order_id") or "")
+            order_id = external.split(":", 1)[1] if ":" in external else (external or None)
+            data = getattr(order, "data", None)
+            symbol = getattr(data, "_name", None) or getattr(data, "name", None)
+            if not symbol:
+                failures.append("symbol_unavailable")
+                continue
+            session = getattr(api, "_execution_session", None)
+            account_id = "legacy"
+            for state in getattr(session, "orders", {}).values():
+                if state.get("client_order_id") == str(client_id) and state.get("account_id"):
+                    account_id = state["account_id"]
+                    break
+            try:
+                reconcile_unknown_order_from_query(
+                    api,
+                    self._profile.sdk_route_key,
+                    QueryOrderRequest(
+                        symbol=str(symbol),
+                        account_id=account_id,
+                        client_order_id=str(client_id),
+                        order_id=order_id,
+                    ),
+                    expected_client_order_id=str(client_id),
+                    query_record=self._provider_query,
+                )
+                recovered += 1
+            except Exception as exc:  # noqa: BLE001 - bounded codes only
+                code = getattr(exc, "code", None)
+                failures.append(str(code if isinstance(code, str) else type(exc).__name__)[:80])
+        return {
+            "unknown_before": len(unknown),
+            "recovered": recovered,
+            "failures": failures[:8],
+        }
 
     def _close_store(self, steps: list[str] | None = None) -> None:
         if self._store is None or not self._store_started:
@@ -709,9 +878,11 @@ class DirectBacktraderSession:
 class _IdlePump(threading.Thread):
     """Drive strategy ``notify_idle`` while a live feed blocks the engine loop."""
 
-    def __init__(self, cerebro: Any) -> None:
+    def __init__(self, cerebro: Any, on_idle: Callable[[], Any] | None = None) -> None:
         super().__init__(name="bt-api-runtime-idle-pump", daemon=True)
         self._cerebro = cerebro
+        self._on_idle = on_idle
+        self._last_maintenance = 0.0
         self._stopped = threading.Event()
 
     def run(self) -> None:
@@ -729,6 +900,9 @@ class _IdlePump(threading.Thread):
                     notify = getattr(strategy, "notify_idle", None)
                     if callable(notify):
                         notify()
+                if self._on_idle is not None and time.monotonic() - self._last_maintenance >= 1.0:
+                    self._last_maintenance = time.monotonic()
+                    self._on_idle()
             except Exception:  # noqa: BLE001 - pump is bounded maintenance
                 continue
 

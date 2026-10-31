@@ -225,11 +225,15 @@ config-driven direct Backtrader paper/live session built from a code-owned
 provider profile, injected credential values and a bounded write grant. It
 reuses the real `BtApiStore`/`BtApiBroker` execution chain, keeps the base
 package free of Backtrader imports, and adds a bounded idle pump for live feeds
-that block the engine maintenance loop. A Binance USD-M Demo paper-account
-round trip (one LIMIT order, submit receipt, accepted, strategy-requested
-cancel, terminal canceled, flat shutdown) was accepted on 2026-10-31 through
-the new entry; that is one venue and does not establish OKX/SimNow, installed
-wheel, production-write or general provider acceptance.
+that block the engine maintenance loop. Binance USD-M Demo (one LIMIT submit/accept/cancel) and OKX SWAP Demo (one
+marketable IOC open plus reduce-only close) paper round trips were accepted on
+2026-10-31 through the same strategy source and two public config templates.
+The session caches instrument rules before the broker cash check, reconciles
+the account before risk initialization, and resolves provider-confirmed
+journal-unknown orders through an injected provider query during the run and
+before shutdown. These are two demo venues only; they do not establish SimNow,
+installed-wheel, production-write or general provider acceptance, and the SDK
+journal still needs a provider-confirmation path for ordinary event streams.
 
 The session is bound to the thread that assembled it. `run()` and `close()`
 must use that owner thread because the proxy is thread-bound. Any thread may

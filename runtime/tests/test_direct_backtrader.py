@@ -149,6 +149,16 @@ class _FakeStore:
     def get_order_readiness(self, symbol, quantity, position_mode=None):
         return {"ready": True, "quantity": quantity, "position_mode": position_mode}
 
+    def get_instrument_spec(self, symbol):
+        return {"multiplier": 1.0, "tick_size": "0.10"}
+
+    def get_reconcile_snapshot(self):
+        return {
+            "positions": [],
+            "open_orders": [],
+            "execution_summary": {"unknown_ids": [], "active_orders": 0},
+        }
+
     def getbroker(self, **kwargs):
         self.broker_kwargs = dict(kwargs)
         return self.broker
@@ -230,12 +240,21 @@ def test_direct_session_composes_real_order_lifecycle_shape():
     assert report.topology == "direct"
     assert report.started is True and report.broker_started is True
     assert report.readiness == {
-        "BTCUSDT": {
-            "environment": "demo",
-            "can_trade": True,
-            "position_mode": "dual_side",
-            "order_ready": True,
-        }
+        "symbols": {
+            "BTCUSDT": {
+                "environment": "demo",
+                "can_trade": True,
+                "position_mode": "dual_side",
+                "order_ready": True,
+                "multiplier": 1.0,
+            }
+        },
+        "reconcile": {
+            "positions": 0,
+            "open_orders": 0,
+            "unknown_ids": 0,
+            "active_orders": 0,
+        },
     }
     assert store.started == 1 and store.stopped == 1
     assert store.broker.started == 1 and store.broker.stopped == 1
@@ -246,6 +265,9 @@ def test_direct_session_composes_real_order_lifecycle_shape():
         "shutdown_timeout": 30.0,
         "approval_expires_at_utc": "2099-01-01T00:00:00Z",
         "approval_max_order_count": 2,
+        "reconcile_retry_max_attempts": 6,
+        "reconcile_retry_backoff": 0.5,
+        "cancel_confirmation_timeout": 5.0,
     }
     assert store.data_kwargs[0]["dataname"] == "BTCUSDT"
     assert store.data_kwargs[0]["orderbook_as_ticks"] is True
