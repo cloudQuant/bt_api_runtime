@@ -134,7 +134,7 @@ def _validate(args: argparse.Namespace) -> int:
         print(json.dumps(failure, sort_keys=True))
         return _EXIT_BLOCKED
     summary = _summary(plan)
-    checks = _checks(plan, include_plugins=False)
+    checks = _checks(plan, include_plugins=True)
     blocked = [check for check in checks if check["status"] == "BLOCKED"]
     payload = {
         "status": "BLOCKED" if blocked else "PASS",

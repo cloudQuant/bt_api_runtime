@@ -65,6 +65,18 @@ def test_validate_rejects_duplicate_and_deferred_mode(tmp_path, capsys):
     assert payload["code"] == "mode_deferred"
 
 
+def test_validate_blocks_enabled_plugins(tmp_path, capsys):
+    path = _config(tmp_path, plugins="  risk: true")
+
+    assert cli.main(["validate", "--config", str(path)]) == 2
+    payload = _json(capsys)
+    assert payload["status"] == "BLOCKED"
+    plugins = next(check for check in payload["checks"] if check["name"] == "plugins")
+    assert plugins["status"] == "BLOCKED"
+    assert plugins["code"] == "plugin_composition_unavailable"
+    assert plugins["enabled"] == ["risk"]
+
+
 def test_doctor_reports_offline_pass_with_not_checked_items(tmp_path, capsys):
     path = _config(tmp_path)
     assert cli.main(["doctor", "--config", str(path)]) == 0
