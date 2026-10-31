@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bt-api-runtime"
-version = "0.1.13"
+version = "0.1.14"
 description = "Constrained I52 paper/live read-only assembly for Backtrader"
 requires-python = ">=3.9"
 dependencies = [
@@ -12,6 +12,9 @@ dependencies = [
     "bt-api-run-contract==0.1.5",
     "bt_api_base>=0.15.8",
 ]
+
+[project.scripts]
+bt-api-runtime = "bt_api_runtime.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
