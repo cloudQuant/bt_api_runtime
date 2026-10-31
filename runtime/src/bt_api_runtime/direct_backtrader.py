@@ -300,6 +300,12 @@ def _json_safe(value: Any) -> Any:
     return repr(value)
 
 
+def _cleanup_failed(steps: Sequence[str]) -> bool:
+    """True when a recorded shutdown step did not confirm completion."""
+
+    return any(step.startswith(("broker.stop.failed", "store.stop.failed")) for step in steps)
+
+
 def _timeframe(name: str):
     from backtrader.dataseries import TimeFrame
 
@@ -588,6 +594,8 @@ class DirectBacktraderSession:
         seconds: float = 60.0,
         initialize_risk_baseline: bool | None = None,
     ) -> DirectSessionReport:
+        if self._closed:
+            raise DirectSessionError("session_closed")
         if not callable(strategy_factory):
             raise DirectSessionError("invalid_strategy_factory")
         timeout = _require_positive_float(seconds, "invalid_session_duration")
@@ -621,10 +629,8 @@ class DirectBacktraderSession:
             self._broker_started = True
             cerebro = self._build_cerebro(strategy_factory, strategy_params or {})
             deadline = time.monotonic() + timeout
-            timer = _Deadline(
-                deadline,
-                lambda: getattr(cerebro, "runstop", None),
-            )
+            stop_engine = getattr(cerebro, "runstop", None)
+            timer = _Deadline(deadline, stop_engine if callable(stop_engine) else None)
             idle_pump = _IdlePump(cerebro, on_idle=self._pump_maintenance)
             timer.start()
             idle_pump.start()
@@ -646,9 +652,16 @@ class DirectBacktraderSession:
             if timer is not None:
                 timer.cancel()
             shutdown = self._shutdown(cleanup_steps)
+            if timer is not None:
+                shutdown["deadline_expired"] = bool(timer.expired)
             post_facts = self._execution_facts()
             if post_facts:
                 shutdown["post_execution_summary"] = post_facts
+            if status == "COMPLETED" and _cleanup_failed(cleanup_steps):
+                # A run may finish while a stop fails; never report a clean
+                # completion when broker/store shutdown was not confirmed.
+                status = "PARTIAL"
+                code = "shutdown_incomplete"
         return DirectSessionReport(
             status=status,
             code=code,
@@ -746,7 +759,10 @@ class DirectBacktraderSession:
 
     def _shutdown(self, steps: list[str]) -> dict[str, Any]:
         state: dict[str, Any] = {}
-        recovery = self._recover_unknown_orders()
+        try:
+            recovery = self._recover_unknown_orders()
+        except Exception:  # noqa: BLE001 - recovery failure must not skip cleanup
+            recovery = {"status": "unavailable", "reason": "recovery_failed"}
         if recovery is not None:
             state["unknown_recovery"] = recovery
         if self._broker is not None:
@@ -765,7 +781,7 @@ class DirectBacktraderSession:
                     state["broker_shutdown_state"] = _json_safe(status())
                 except Exception:  # noqa: BLE001
                     state["broker_shutdown_state"] = "unavailable"
-        self._close_store(steps)
+        state["store_stop"] = self._close_store(steps)
         if self._store is not None:
             state["store_connected"] = bool(getattr(self._store, "is_connected", False))
         self._closed = True
@@ -868,19 +884,25 @@ class DirectBacktraderSession:
             "failures": failures[:8],
         }
 
-    def _close_store(self, steps: list[str] | None = None) -> None:
-        if self._store is None or not self._store_started:
-            return
+    def _close_store(self, steps: list[str] | None = None) -> str:
+        if self._store is None:
+            return "not_started"
+        if not self._store_started:
+            return "already_stopped"
         stop = getattr(self._store, "stop", None)
+        result = "unavailable"
         if callable(stop):
             try:
                 stop()
+                result = "returned"
                 if steps is not None:
                     steps.append("store.stop")
             except Exception as exc:  # noqa: BLE001
+                result = "failed:" + type(exc).__name__[:40]
                 if steps is not None:
                     steps.append("store.stop.failed:" + type(exc).__name__[:40])
         self._store_started = False
+        return result
 
     def close(self) -> None:
         if self._closed:
@@ -927,8 +949,15 @@ class _Deadline(threading.Thread):
     def __init__(self, deadline: float, stop: Callable[[], Any] | None) -> None:
         super().__init__(name="bt-api-runtime-deadline", daemon=True)
         self._deadline = deadline
-        self._stop = stop
+        # ``_stop`` is reserved by threading.Thread; keep the callback apart so
+        # thread teardown cannot invoke the engine stop a second time.
+        self._stop_callback = stop
         self._cancelled = threading.Event()
+        self._expired = False
+
+    @property
+    def expired(self) -> bool:
+        return self._expired
 
     def run(self) -> None:
         remaining = self._deadline - time.monotonic()
@@ -936,9 +965,10 @@ class _Deadline(threading.Thread):
             self._cancelled.wait(remaining)
         if self._cancelled.is_set():
             return
-        if callable(self._stop):
+        self._expired = True
+        if callable(self._stop_callback):
             try:
-                self._stop()
+                self._stop_callback()
             except Exception:  # noqa: BLE001 - deadline is best effort
                 return
 
