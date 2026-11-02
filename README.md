@@ -2,6 +2,8 @@
 
 ## System role and authority boundary
 
+The working-tree Backtrader service imports use `backtrader.service.service_read_proxy`; neutral market bindings come from `bt_api_py.service_market_bindings`. This cross-package migration has not been behavior- or distribution-validated, and older tests still reference the retired path.
+
 The independently built [`contracts/`](contracts/README.md) package provides a
 pure-data parser and symbolic route matcher for the initial I52 schema. The new
 [`runtime/`](runtime/README.md) build root adds a first constrained assembly

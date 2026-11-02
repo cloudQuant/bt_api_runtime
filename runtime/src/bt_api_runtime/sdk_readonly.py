@@ -335,11 +335,12 @@ def _load_sdk() -> dict[str, Any]:
     failed = False
     try:
         service_market = import_module("bt_api_py.service_market")
-        from backtrader.stores.service_read_proxy import ServiceFeedBinding, ServiceReadProxy
+        from backtrader.service.service_read_proxy import ServiceReadProxy
         from bt_api_base.account_protocol import AccountKey, AccountResourceKey
         from bt_api_base.market_protocol import MarketInstrumentKey, MarketSubscriptionKey
         from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
         from bt_api_py.service_account import ServiceAccountClient
+        from bt_api_py.service_market_bindings import ServiceFeedBinding
         from bt_api_py.service_config import ClientConfig
         from bt_api_py.service_runtime import ServiceClientRuntime
     except Exception:  # noqa: BLE001 - map optional import failures to one finite code

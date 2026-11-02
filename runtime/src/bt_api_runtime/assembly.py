@@ -18,7 +18,7 @@ from backtrader.cerebro import Cerebro
 from backtrader.dataseries import TimeFrame
 from backtrader.feeds.btapifeed import BtApiFeed
 from backtrader.stores.btapistore import BtApiStore
-from backtrader.stores.service_read_proxy import ServiceReadProxy
+from backtrader.service.service_read_proxy import ServiceReadProxy
 from backtrader.strategy import Strategy
 from bt_api_run_contract import (
     Environment,
